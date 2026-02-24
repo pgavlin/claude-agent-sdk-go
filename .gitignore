@@ -1,0 +1,18 @@
+# Test and coverage artifacts
+*.test
+*.out
+*.prof
+coverage.html
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Example binaries
+examples/*/main

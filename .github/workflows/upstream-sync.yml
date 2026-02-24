@@ -1,0 +1,94 @@
+name: Check upstream Python SDK releases
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LABEL: upstream-sync
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for new upstream release
+        run: |
+          set -euo pipefail
+
+          # 1. Fetch latest upstream release
+          release_json=$(gh api repos/anthropics/claude-agent-sdk-python/releases/latest)
+          upstream_tag=$(echo "$release_json" | jq -r '.tag_name')
+          upstream_url=$(echo "$release_json" | jq -r '.html_url')
+          upstream_date=$(echo "$release_json" | jq -r '.published_at' | cut -dT -f1)
+          upstream_body=$(echo "$release_json" | jq -r '.body // ""')
+
+          echo "Latest upstream release: $upstream_tag ($upstream_date)"
+
+          # 2. Read local UPSTREAM_VERSION
+          local_version=$(cat UPSTREAM_VERSION | tr -d '[:space:]')
+          echo "Local UPSTREAM_VERSION: $local_version"
+
+          # 3. If versions match, close any open tracking issue and exit
+          if [ "$upstream_tag" = "$local_version" ]; then
+            echo "Versions match — SDK is up to date."
+            issue_number=$(gh issue list --label "$LABEL" --state open --json number --jq '.[0].number // empty')
+            if [ -n "$issue_number" ]; then
+              gh issue close "$issue_number" \
+                --comment "Closed automatically: UPSTREAM_VERSION matches latest upstream release \`$upstream_tag\`."
+              echo "Closed issue #$issue_number."
+            fi
+            exit 0
+          fi
+
+          echo "Version mismatch — upstream $upstream_tag != local $local_version"
+
+          # Build issue body
+          issue_body=$(cat <<EOF
+          ## Upstream Release
+
+          | | |
+          |---|---|
+          | **Upstream version** | [\`$upstream_tag\`]($upstream_url) |
+          | **Published** | $upstream_date |
+          | **Go SDK synced to** | \`$local_version\` |
+
+          ## Release Notes
+
+          $upstream_body
+
+          ---
+
+          > **Action required:** Review the upstream changes, port any relevant updates to this Go SDK, then update \`UPSTREAM_VERSION\` to \`$upstream_tag\` and merge.
+          EOF
+          )
+
+          issue_title="Upstream Python SDK released $upstream_tag"
+
+          # 4. Search for existing open issue
+          issue_number=$(gh issue list --label "$LABEL" --state open --json number --jq '.[0].number // empty')
+
+          if [ -z "$issue_number" ]; then
+            # 5. No open issue — create label (idempotent) and issue
+            gh label create "$LABEL" --description "Tracks upstream claude-agent-sdk-python releases" --color "1d76db" --force
+            gh issue create --title "$issue_title" --body "$issue_body" --label "$LABEL"
+            echo "Created new tracking issue."
+          else
+            # Check if the open issue already tracks this exact version
+            existing_title=$(gh issue view "$issue_number" --json title --jq '.title')
+            if [ "$existing_title" = "$issue_title" ]; then
+              echo "Issue #$issue_number already tracks $upstream_tag — no-op."
+            else
+              # 6. Open issue tracks an older version — update it
+              gh issue edit "$issue_number" --title "$issue_title" --body "$issue_body"
+              gh issue comment "$issue_number" \
+                --body "Updated: upstream released \`$upstream_tag\` (previously tracking \`${existing_title##* }\`)."
+              echo "Updated issue #$issue_number to track $upstream_tag."
+            fi
+          fi
