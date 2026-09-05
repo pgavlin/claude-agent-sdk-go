@@ -383,3 +383,52 @@ func TestProjectKeyForDirectory(t *testing.T) {
 		t.Error("expected the project key to be stable across calls")
 	}
 }
+
+func TestNormalizePathNFC(t *testing.T) {
+	// The same text in composed and decomposed form must normalize to one
+	// representation. macOS HFS+ stores decomposed, so without this the SDK
+	// and the CLI would disagree about a path containing non-ASCII text.
+	// Written as escapes so the fixtures cannot be silently composed
+	// by an editor, which would make this test vacuous.
+	composed := "/tmp/caf\u00e9"    // precomposed U+00E9
+	decomposed := "/tmp/cafe\u0301" // e + U+0301 combining acute
+
+	if composed == decomposed {
+		t.Fatal("test inputs are already identical; the fixture is wrong")
+	}
+	if normalizePath(composed) != normalizePath(decomposed) {
+		t.Errorf("expected both forms to normalize alike:\n composed:   %q\n decomposed: %q",
+			normalizePath(composed), normalizePath(decomposed))
+	}
+	if normalizePath(composed) != composed {
+		t.Errorf("expected the composed form to be the NFC representative, got %q", normalizePath(composed))
+	}
+}
+
+func TestProjectKeyIsNormalizationInsensitive(t *testing.T) {
+	// This is the bug NFC prevents: sanitizePath maps each non-alphanumeric
+	// rune to a hyphen, so a decomposed path yields an extra hyphen and a
+	// different project key than its composed twin.
+	composed := ProjectKeyForDirectory("/tmp/caf\u00e9/project")
+	decomposed := ProjectKeyForDirectory("/tmp/cafe\u0301/project")
+
+	// Without normalization these differ: sanitizePath maps the combining
+	// accent to its own hyphen, yielding "-tmp-cafe--project" against
+	// "-tmp-caf--project".
+	if composed != decomposed {
+		t.Errorf("expected one project key for both normalization forms, got %q and %q",
+			composed, decomposed)
+	}
+}
+
+func TestCanonicalizePathNormalizesUnresolvablePaths(t *testing.T) {
+	// A path that cannot be resolved still has to yield a stable key, so
+	// the fallback branches normalize too.
+	missing := filepath.Join(t.TempDir(), "does-not-exist-caf\u00e9")
+	missingDecomposed := filepath.Join(filepath.Dir(missing), "does-not-exist-cafe\u0301")
+
+	if canonicalizePath(missing) != canonicalizePath(missingDecomposed) {
+		t.Errorf("expected the unresolvable-path fallback to normalize, got %q and %q",
+			canonicalizePath(missing), canonicalizePath(missingDecomposed))
+	}
+}

@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 	"unicode"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // ErrSessionNotFound is returned when a session's transcript cannot be
@@ -652,25 +654,75 @@ var unicodeStripRe = regexp.MustCompile("[" +
 	"\ue000-\uf8ff" + // Basic Multilingual Plane private use
 	"]")
 
-// sanitizeUnicode removes dangerous Unicode characters from a string:
-// format characters, private-use characters, surrogates, and the explicit
-// ranges above.
+// assignedCategories are the Unicode general-category aggregates covering
+// every assigned code point. A rune in none of them is unassigned, which is
+// category Cn — the standard library has no table for Cn, because unassigned
+// code points appear in no table by construction.
+var assignedCategories = []*unicode.RangeTable{
+	unicode.L, unicode.M, unicode.N, unicode.P, unicode.S, unicode.Z, unicode.C,
+}
+
+// isStrippedCategory reports whether a rune belongs to a category that tag
+// sanitization removes: Cf (format), Co (private use), Cs (surrogate), or Cn
+// (unassigned).
 //
-// Unlike the Python SDK this applies no NFKC normalization, which would
-// require a dependency outside the standard library, and it does not strip
-// unassigned (Cn) code points, since the standard library exposes no table
-// for them. Strings that are already normalized — which covers ordinary tag
-// text — sanitize identically.
-func sanitizeUnicode(value string) string {
-	var b strings.Builder
-	b.Grow(len(value))
-	for _, r := range value {
-		if unicode.In(r, unicode.Cf, unicode.Co, unicode.Cs) {
-			continue
-		}
-		b.WriteRune(r)
+// These are the categories most readily abused for display spoofing and
+// injection, and they match the set the Python and TypeScript SDKs strip.
+func isStrippedCategory(r rune) bool {
+	if unicode.In(r, unicode.Cf, unicode.Co, unicode.Cs) {
+		return true
 	}
-	return unicodeStripRe.ReplaceAllString(b.String(), "")
+	for _, table := range assignedCategories {
+		if unicode.Is(table, r) {
+			return false
+		}
+	}
+	// In no assigned category, so Cn.
+	return true
+}
+
+// sanitizeUnicodeMaxIterations bounds the normalize-and-strip loop. A single
+// pass is not enough: NFKC can decompose a character into a sequence that
+// includes a format character, and removing a character can let its
+// neighbours compose differently on the next pass. The loop runs to a fixed
+// point, and the bound keeps a pathological input from spinning.
+const sanitizeUnicodeMaxIterations = 10
+
+// sanitizeUnicode removes Unicode characters that are dangerous in a tag:
+// format, private-use, surrogate, and unassigned code points, plus the
+// explicit ranges above.
+//
+// It applies NFKC normalization and stripping repeatedly until the result
+// stops changing, matching the Python SDK. NFKC folds compatibility
+// characters onto their canonical equivalents, so visually confusable forms
+// collapse to one representation and a tag cannot smuggle a lookalike past
+// a CLI filter comparing plain strings.
+func sanitizeUnicode(value string) string {
+	current := value
+	for i := 0; i < sanitizeUnicodeMaxIterations; i++ {
+		previous := current
+
+		current = norm.NFKC.String(current)
+
+		var b strings.Builder
+		b.Grow(len(current))
+		for _, r := range current {
+			if isStrippedCategory(r) {
+				continue
+			}
+			b.WriteRune(r)
+		}
+		// The explicit ranges are redundant with the category checks above,
+		// but are kept so the stripped set stays pinned to the same
+		// characters the other SDKs name even if a category table shifts
+		// between Unicode revisions.
+		current = unicodeStripRe.ReplaceAllString(b.String(), "")
+
+		if current == previous {
+			break
+		}
+	}
+	return current
 }
 
 // isoNow returns the current UTC time as an ISO-8601 string with a trailing

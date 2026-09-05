@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Go SDK for the Claude Code CLI (`github.com/pgavlin/claude-agent-sdk-go`, package `agentsdk`). Ported from the upstream [Python SDK](https://github.com/anthropics/claude-agent-sdk-python) (synced to version in `UPSTREAM_VERSION`). Zero external dependencies, Go 1.23+ (uses `iter.Seq`). Communicates with the Claude CLI over stdin/stdout using newline-delimited JSON.
+Go SDK for the Claude Code CLI (`github.com/pgavlin/claude-agent-sdk-go`, package `agentsdk`). Ported from the upstream [Python SDK](https://github.com/anthropics/claude-agent-sdk-python) (synced to version in `UPSTREAM_VERSION`). Go 1.23+ (uses `iter.Seq`). One dependency, `golang.org/x/text`, pinned to v0.25.0 — the last release whose own `go` directive stays at 1.23, so the CI matrix keeps working. It supplies NFC path normalization and NFKC tag folding; both are load-bearing for matching the CLI's on-disk layout, so do not swap them for hand-rolled approximations. Communicates with the Claude CLI over stdin/stdout using newline-delimited JSON.
 
 ## Commands
 
@@ -64,7 +64,8 @@ User Code
 - **Test helpers**: `TestMain` in `integration_test.go` intercepts subprocess re-invocations via `AGENTSDK_TEST_HELPER` env var to simulate the CLI (modes: `fake-cli`, `echo-json`, `version`, etc.). `chanTransport` in `protocol_test.go` provides an in-memory mock transport.
 - **CanUseTool callback**: When set on options, `configureCanUseTool` sets `PermissionPromptToolName = "stdio"` (and rejects the combination with an explicit prompt-tool name). The callback receives tool name, input, and permission context; returns `PermissionAllow` or `PermissionDeny`. `CanUseToolShadowedWarning` reports options that auto-approve tools before the callback runs.
 - **Transcript byte shape**: Go sorts map keys when marshaling, but the CLI writes `"type"` first and the lite parse scans for a `{"type":"tag"` line prefix. Every transcript writer goes through `marshalTypeFirst` so the two agree.
-- **Zero-dependency deviations from upstream**: no Unicode NFC normalization of paths, no NFKC normalization in tag sanitization, and no OpenTelemetry span injection (`TRACEPARENT`/`TRACESTATE` are inherited from the process environment instead). In-process SDK MCP servers are also out of scope, since they would require an MCP server dependency.
+- **Unicode normalization**: `normalizePath` (NFC) is applied wherever a path becomes a project key — `claudeConfigHomeDir`, `projectsDir`, `canonicalizePath`, and the worktree scan — because `sanitizePath` maps every non-alphanumeric rune to a hyphen, so a decomposed path yields a *different* key than its composed twin and the session would be invisible. `sanitizeUnicode` (NFKC) folds compatibility forms in tags and strips Cf/Co/Cs/Cn, looping to a fixed point since one pass can expose new characters. Go has no `Cn` table, so unassigned code points are detected as "in none of L/M/N/P/S/Z/C".
+- **Remaining deviations from upstream**: no OpenTelemetry span injection (`TRACEPARENT`/`TRACESTATE` are inherited from the process environment instead), and in-process SDK MCP servers are out of scope, since they would require an MCP server dependency.
 
 ## Examples
 

@@ -2,7 +2,9 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/pgavlin/claude-agent-sdk-go.svg)](https://pkg.go.dev/github.com/pgavlin/claude-agent-sdk-go)
 
-Go SDK for building agents and automations on top of [Claude Code](https://docs.anthropic.com/en/docs/claude-code). It communicates with the Claude Code CLI over stdin/stdout using newline-delimited JSON. Zero external dependencies.
+Go SDK for building agents and automations on top of [Claude Code](https://docs.anthropic.com/en/docs/claude-code). It communicates with the Claude Code CLI over stdin/stdout using newline-delimited JSON.
+
+The only dependency is `golang.org/x/text`, for the Unicode normalization the session helpers need: the CLI derives its project directory names from NFC-normalized paths, so the SDK has to normalize identically or the two disagree on filesystems that store decomposed Unicode.
 
 ## Requirements
 

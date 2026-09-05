@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // SDKSessionInfo is session metadata returned by ListSessions.
@@ -157,22 +159,30 @@ func sanitizePath(name string) string {
 	return sanitized[:maxSanitizedLength] + "-" + simpleHash(name)
 }
 
+// normalizePath applies Unicode NFC normalization to a filesystem path.
+//
+// The CLI derives its project directory names from NFC-normalized paths, so
+// the SDK must normalize identically or the two disagree on filesystems that
+// store decomposed Unicode — notably macOS HFS+, where a path containing "é"
+// round-trips as "e" plus a combining accent. Without this, a session
+// written by the CLI would be invisible to the SDK's readers, and a
+// store-mirrored session would land under a different project key than its
+// local counterpart.
+func normalizePath(path string) string {
+	return norm.NFC.String(path)
+}
+
 // claudeConfigHomeDir returns the Claude config directory, respecting
 // CLAUDE_CONFIG_DIR.
-//
-// Unlike the Python SDK this does not apply Unicode NFC normalization to the
-// path, since that would require a dependency outside the standard library.
-// Paths that are already NFC — every ASCII path, and what Linux and Windows
-// filesystems typically store — resolve identically.
 func claudeConfigHomeDir() string {
 	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
-		return dir
+		return normalizePath(dir)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ".claude"
 	}
-	return filepath.Join(home, ".claude")
+	return normalizePath(filepath.Join(home, ".claude"))
 }
 
 // projectsDir returns the projects directory. envOverride is consulted
@@ -181,7 +191,7 @@ func claudeConfigHomeDir() string {
 // writes to.
 func projectsDir(envOverride map[string]string) string {
 	if override := envOverride["CLAUDE_CONFIG_DIR"]; override != "" {
-		return filepath.Join(override, "projects")
+		return filepath.Join(normalizePath(override), "projects")
 	}
 	return filepath.Join(claudeConfigHomeDir(), "projects")
 }
@@ -192,19 +202,21 @@ func projectDirFor(projectPath string) string {
 }
 
 // canonicalizePath resolves a directory to its canonical form, following
-// symlinks. It falls back to the input on error.
+// symlinks and applying NFC normalization. It falls back to the input on
+// error, still normalized, so a path that cannot be resolved still yields a
+// stable project key.
 func canonicalizePath(d string) string {
 	resolved, err := filepath.EvalSymlinks(d)
 	if err != nil {
 		if abs, absErr := filepath.Abs(d); absErr == nil {
-			return abs
+			return normalizePath(abs)
 		}
-		return d
+		return normalizePath(d)
 	}
 	if abs, err := filepath.Abs(resolved); err == nil {
-		return abs
+		return normalizePath(abs)
 	}
-	return resolved
+	return normalizePath(resolved)
 }
 
 // isDir reports whether path exists and is a directory.
@@ -458,7 +470,7 @@ func getWorktreePaths(cwd string) []string {
 	var paths []string
 	for _, line := range strings.Split(string(out), "\n") {
 		if after, ok := strings.CutPrefix(line, "worktree "); ok {
-			paths = append(paths, strings.TrimRight(after, "\r"))
+			paths = append(paths, normalizePath(strings.TrimRight(after, "\r")))
 		}
 	}
 	return paths

@@ -456,3 +456,67 @@ func TestImportSessionToStoreNotFound(t *testing.T) {
 		t.Errorf("expected ErrSessionNotFound, got %v", err)
 	}
 }
+
+func TestSanitizeUnicodeNFKCFolding(t *testing.T) {
+	// NFKC folds compatibility characters onto their canonical forms, so a
+	// tag cannot smuggle a visual lookalike past a filter comparing plain
+	// strings.
+	for _, tc := range []struct {
+		name, in, want string
+	}{
+		{"ligature", "\ufb01le", "file"},           // U+FB01 LATIN SMALL LIGATURE FI
+		{"fullwidth", "\uff34\uff41\uff47", "Tag"}, // fullwidth T, a, g
+		{"circled digit", "v\u2460", "v1"},         // U+2460 CIRCLED DIGIT ONE
+		{"roman numeral", "\u2168", "IX"},          // U+2168 ROMAN NUMERAL NINE
+		{"superscript", "x\u00b2", "x2"},           // U+00B2 SUPERSCRIPT TWO
+		{"nbsp folds to space", "a\u00a0b", "a b"}, // U+00A0 NO-BREAK SPACE
+	} {
+		if got := sanitizeUnicode(tc.in); got != tc.want {
+			t.Errorf("%s: sanitizeUnicode(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestSanitizeUnicodeStripsUnassigned(t *testing.T) {
+	// U+0378 is unassigned (category Cn). The standard library has no Cn
+	// table, so this exercises the "in no assigned category" fallback.
+	if got := sanitizeUnicode("tag\u0378name"); got != "tagname" {
+		t.Errorf("expected an unassigned code point to be stripped, got %q", got)
+	}
+	// U+E000 is private use (Co) and U+FEFF is a format character (Cf).
+	if got := sanitizeUnicode("a\ue000b\ufeffc"); got != "abc" {
+		t.Errorf("expected private-use and format characters to be stripped, got %q", got)
+	}
+}
+
+func TestSanitizeUnicodeIsIdempotent(t *testing.T) {
+	// The loop runs to a fixed point, so a second pass must be a no-op.
+	for _, in := range []string{
+		"plain",
+		"o\ufb01ce",
+		"\uff34\uff41\uff47",
+		"a\u200b\u202e\ufeff\ue000\u0378b",
+		"\u2168\u00b2\u2460",
+	} {
+		once := sanitizeUnicode(in)
+		if twice := sanitizeUnicode(once); twice != once {
+			t.Errorf("sanitizeUnicode is not idempotent for %q: %q then %q", in, once, twice)
+		}
+	}
+}
+
+func TestTagSessionFoldsCompatibilityForms(t *testing.T) {
+	root := withProjectsDir(t)
+	writeTranscript(t, root, "proj", testSessionID, []map[string]any{
+		userEntry(testUUIDA, "", "prompt"),
+	})
+
+	// A fullwidth tag is stored in its folded form, so it matches a plain
+	// ASCII filter.
+	if err := TagSession(testSessionID, "\uff32\uff45\uff56\uff49\uff45\uff57", ""); err != nil {
+		t.Fatalf("TagSession failed: %v", err)
+	}
+	if info := GetSessionInfo(testSessionID, ""); info.Tag != "Review" {
+		t.Errorf("expected the fullwidth tag to fold to ASCII, got %q", info.Tag)
+	}
+}
