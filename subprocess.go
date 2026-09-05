@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -42,7 +44,14 @@ type SubprocessTransport struct {
 
 	writeMu sync.Mutex
 	ready   bool
-	done    chan struct{}
+
+	// done is closed once the process has been reaped. Only one waiter
+	// reaps it: the ReadMessages iterator when one is running, and Close
+	// otherwise. reaping guards that choice, and doneOnce keeps the close
+	// idempotent.
+	done     chan struct{}
+	doneOnce sync.Once
+	reaping  atomic.Bool
 }
 
 // NewSubprocessTransport creates a new subprocess transport.
@@ -212,14 +221,16 @@ func (t *SubprocessTransport) ReadMessages(ctx context.Context) iter.Seq2[map[st
 			}
 		}
 
-		// Wait for process exit after stdout closes
-		if t.cmd != nil {
+		// Wait for process exit after stdout closes. Claim the reap so a
+		// concurrent Close does not call Wait on the same process.
+		if t.cmd != nil && t.reaping.CompareAndSwap(false, true) {
 			if err := t.cmd.Wait(); err != nil {
-				if exitErr, ok := err.(*exec.ExitError); ok {
+				var exitErr *exec.ExitError
+				if errors.As(err, &exitErr) {
 					yield(nil, NewProcessError("CLI process exited with error", exitErr.ExitCode(), ""))
 				}
 			}
-			close(t.done)
+			t.markDone()
 		}
 	}
 }
@@ -243,6 +254,16 @@ func (t *SubprocessTransport) Close() error {
 		return nil
 	}
 
+	// With no ReadMessages iterator running there is nobody to reap the
+	// process, so Close does it: waiting on done would otherwise stall for
+	// every grace period and then return with the process still unreaped.
+	if t.reaping.CompareAndSwap(false, true) {
+		go func() {
+			_ = t.cmd.Wait()
+			t.markDone()
+		}()
+	}
+
 	// Stage 1: wait for graceful exit after stdin EOF.
 	if t.waitForExit(closeGracePeriod) {
 		return nil
@@ -262,9 +283,13 @@ func (t *SubprocessTransport) Close() error {
 	return nil
 }
 
-// waitForExit reports whether the process exited within the timeout. The
-// done channel is closed by the ReadMessages iterator once it has reaped the
-// process.
+// markDone closes the done channel exactly once.
+func (t *SubprocessTransport) markDone() {
+	t.doneOnce.Do(func() { close(t.done) })
+}
+
+// waitForExit reports whether the process exited within the timeout,
+// signaled by whichever of the ReadMessages iterator or Close reaped it.
 func (t *SubprocessTransport) waitForExit(timeout time.Duration) bool {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()

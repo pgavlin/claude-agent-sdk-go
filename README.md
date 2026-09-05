@@ -100,6 +100,39 @@ client := agentsdk.NewClient(&agentsdk.ClaudeAgentOptions{
 })
 ```
 
+## Session history
+
+Past sessions are readable straight from the CLI's on-disk transcripts, with
+no subprocess and no API calls:
+
+```go
+sessions := agentsdk.ListSessions(agentsdk.ListSessionsOptions{
+	Directory: "/path/to/project",
+	Limit:     10,
+})
+
+messages := agentsdk.GetSessionMessages(sessions[0].SessionID, "", 0, 0)
+```
+
+Sessions can also be renamed, tagged, forked, and deleted — see
+[`examples/sessions`](examples/sessions).
+
+## Mirroring sessions to an external store
+
+Set `SessionStore` to mirror every transcript line the CLI writes into your
+own storage, and to resume from it when the local file is absent:
+
+```go
+store := agentsdk.NewInMemorySessionStore() // or your own adapter
+
+opts := &agentsdk.ClaudeAgentOptions{SessionStore: store}
+```
+
+An adapter implements `Append` and `Load`, plus whichever of the optional
+`SessionLister`, `SessionSummaryLister`, `SessionDeleter`, and
+`SessionSubkeyLister` capabilities it supports. See
+[`examples/sessionstore`](examples/sessionstore).
+
 ## Examples
 
 The [`examples/`](examples/) directory contains complete working programs:
@@ -118,6 +151,8 @@ The [`examples/`](examples/) directory contains complete working programs:
 | [`mcpserver`](examples/mcpserver) | Configure MCP servers via stdio, SSE, HTTP transports |
 | [`partialmessages`](examples/partialmessages) | Stream incremental updates with `IncludePartialMessages` |
 | [`plugin`](examples/plugin) | Load and configure local plugins |
+| [`sessions`](examples/sessions) | List, read, rename, tag, and fork past sessions |
+| [`sessionstore`](examples/sessionstore) | Mirror session transcripts to an external store |
 | [`settingsources`](examples/settingsources) | Control which settings load (user/project/default) |
 | [`stderr`](examples/stderr) | Capture CLI debug output via `Stderr` callback |
 | [`systemprompt`](examples/systemprompt) | Configure system prompt: none, string, preset, or appended |
