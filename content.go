@@ -42,3 +42,49 @@ type ToolResultBlock struct {
 }
 
 func (ToolResultBlock) contentBlockType() string { return "tool_result" }
+
+// ServerToolName identifies a server-side tool executed by the API.
+type ServerToolName string
+
+const (
+	// ServerToolAdvisor is the advisor server tool.
+	ServerToolAdvisor ServerToolName = "advisor"
+	// ServerToolWebSearch is the web search server tool.
+	ServerToolWebSearch ServerToolName = "web_search"
+	// ServerToolWebFetch is the web fetch server tool.
+	ServerToolWebFetch ServerToolName = "web_fetch"
+	// ServerToolCodeExecution is the code execution server tool.
+	ServerToolCodeExecution ServerToolName = "code_execution"
+	// ServerToolBashCodeExecution is the bash code execution server tool.
+	ServerToolBashCodeExecution ServerToolName = "bash_code_execution"
+	// ServerToolTextEditorCodeExecution is the text editor code execution server tool.
+	ServerToolTextEditorCodeExecution ServerToolName = "text_editor_code_execution"
+	// ServerToolSearchToolRegex is the regex tool-search server tool.
+	ServerToolSearchToolRegex ServerToolName = "tool_search_tool_regex"
+	// ServerToolSearchToolBM25 is the BM25 tool-search server tool.
+	ServerToolSearchToolBM25 ServerToolName = "tool_search_tool_bm25"
+)
+
+// ServerToolUseBlock represents a server-side tool invocation, such as
+// advisor, web_search, or web_fetch. The API executes these on the model's
+// behalf, so they appear alongside regular tool_use blocks but the caller
+// never returns a result. Branch on Name to identify the tool.
+type ServerToolUseBlock struct {
+	Type  string         `json:"type"` // "server_tool_use"
+	ID    string         `json:"id"`
+	Name  ServerToolName `json:"name"`
+	Input map[string]any `json:"input"`
+}
+
+func (ServerToolUseBlock) contentBlockType() string { return "server_tool_use" }
+
+// ServerToolResultBlock represents the result of a server-side tool call.
+// Content is the raw dict from the API and is opaque to the SDK; callers
+// that care about a specific tool's result schema can inspect its "type" key.
+type ServerToolResultBlock struct {
+	Type      string         `json:"type"` // "advisor_tool_result"
+	ToolUseID string         `json:"tool_use_id"`
+	Content   map[string]any `json:"content"`
+}
+
+func (ServerToolResultBlock) contentBlockType() string { return "advisor_tool_result" }

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"sync"
@@ -34,6 +35,16 @@ type protocolQuery struct {
 
 	hookCallbacks map[string]HookCallback
 
+	// inflightMu guards inflight, which maps a control request ID to the
+	// cancel function of its handler goroutine so a control_cancel_request
+	// can abandon it.
+	inflightMu sync.Mutex
+	inflight   map[string]context.CancelFunc
+
+	// mirror receives transcript_mirror frames when a SessionStore is
+	// configured. It is nil otherwise.
+	mirror *transcriptMirrorBatcher
+
 	firstResult     chan struct{}
 	firstResultOnce sync.Once
 }
@@ -54,6 +65,7 @@ func newProtocolQuery(transport Transport, opts *ClaudeAgentOptions) *protocolQu
 		readDone:      make(chan struct{}),
 		pending:       make(map[string]chan controlResult),
 		hookCallbacks: make(map[string]HookCallback),
+		inflight:      make(map[string]context.CancelFunc),
 		firstResult:   make(chan struct{}),
 	}
 }
@@ -80,6 +92,20 @@ func (q *protocolQuery) Initialize(ctx context.Context) (map[string]any, error) 
 
 	if q.opts.Agents != nil {
 		request["agents"] = q.opts.Agents
+	}
+
+	if preset, ok := q.opts.SystemPrompt.(*SystemPromptPreset); ok && preset.ExcludeDynamicSections != nil {
+		request["excludeDynamicSections"] = *preset.ExcludeDynamicSections
+	}
+
+	// SkillsAll and an omitted value are equivalent on the wire, since
+	// neither installs a filter, so only an explicit list is sent.
+	if skills, ok := q.opts.Skills.([]string); ok {
+		request["skills"] = skills
+	}
+
+	if q.opts.ForwardSubagentText {
+		request["forwardSubagentText"] = true
 	}
 
 	timeout := q.initTimeout()
@@ -132,6 +158,80 @@ func (q *protocolQuery) McpStatus(ctx context.Context) (map[string]any, error) {
 	return q.sendControlRequest(ctx, map[string]any{"subtype": "mcp_status"})
 }
 
+func (q *protocolQuery) GetContextUsage(ctx context.Context) (map[string]any, error) {
+	return q.sendControlRequest(ctx, map[string]any{"subtype": "get_context_usage"})
+}
+
+func (q *protocolQuery) ReconnectMcpServer(ctx context.Context, serverName string) error {
+	_, err := q.sendControlRequest(ctx, map[string]any{
+		"subtype": "mcp_reconnect",
+		// The wire protocol uses camelCase for this field.
+		"serverName": serverName,
+	})
+	return err
+}
+
+func (q *protocolQuery) ToggleMcpServer(ctx context.Context, serverName string, enabled bool) error {
+	_, err := q.sendControlRequest(ctx, map[string]any{
+		"subtype": "mcp_toggle",
+		// The wire protocol uses camelCase for this field.
+		"serverName": serverName,
+		"enabled":    enabled,
+	})
+	return err
+}
+
+func (q *protocolQuery) StopTask(ctx context.Context, taskID string) error {
+	_, err := q.sendControlRequest(ctx, map[string]any{
+		"subtype": "stop_task",
+		"task_id": taskID,
+	})
+	return err
+}
+
+// setMirrorBatcher attaches a batcher that receives transcript_mirror
+// frames. When set, the read loop peels those frames off stdout rather than
+// yielding them to consumers, enqueues them on the batcher, and flushes
+// before yielding each result message.
+func (q *protocolQuery) setMirrorBatcher(b *transcriptMirrorBatcher) {
+	q.mirror = b
+}
+
+// reportMirrorError surfaces a SessionStore.Append failure as a system
+// message. It is called from the batcher's error callback; the dropped batch
+// is not retried further, so this is the consumer's only signal. It never
+// blocks: when the message buffer is full the error is logged and dropped
+// rather than back-pressuring the read loop.
+func (q *protocolQuery) reportMirrorError(key *SessionKey, errText string) {
+	data := map[string]any{
+		"type":       "system",
+		"subtype":    "mirror_error",
+		"error":      errText,
+		"uuid":       newRequestID(),
+		"session_id": "",
+	}
+	if key != nil {
+		data["key"] = map[string]any{
+			"project_key": key.ProjectKey,
+			"session_id":  key.SessionID,
+			"subpath":     key.Subpath,
+		}
+		data["session_id"] = key.SessionID
+	}
+
+	msg := &MirrorErrorMessage{
+		SystemMessage: SystemMessage{Subtype: "mirror_error", Data: data},
+		Key:           key,
+		Error:         errText,
+	}
+
+	select {
+	case q.messages <- msg:
+	default:
+		log.Printf("agentsdk: dropping mirror_error message (buffer full): %s", errText)
+	}
+}
+
 func (q *protocolQuery) WriteUserMessage(ctx context.Context, prompt string, sessionID string) error {
 	msg := map[string]any{
 		"type":               "user",
@@ -168,6 +268,18 @@ func (q *protocolQuery) Done() <-chan struct{} {
 func (q *protocolQuery) readLoop(ctx context.Context) {
 	defer close(q.readDone)
 	defer close(q.messages)
+	// Flush any remaining mirror entries before closing, so an early stdout
+	// EOF or transport error does not drop entries batched this turn. Also
+	// unblock any waiter on the first result so it does not stall for the
+	// full timeout on an early exit.
+	defer func() {
+		if q.mirror != nil {
+			q.mirror.flush(context.WithoutCancel(ctx))
+		}
+		q.firstResultOnce.Do(func() {
+			close(q.firstResult)
+		})
+	}()
 
 	for data, err := range q.transport.ReadMessages(ctx) {
 		if err != nil {
@@ -186,10 +298,31 @@ func (q *protocolQuery) readLoop(ctx context.Context) {
 		switch msgType {
 		case "control_response":
 			q.handleControlResponse(data)
+
 		case "control_request":
-			go q.handleControlRequest(ctx, data)
+			q.spawnControlRequestHandler(ctx, data)
+
 		case "control_cancel_request":
-			continue
+			// The CLI has abandoned the request, so cancel the handler and
+			// write no response.
+			if cancelID, _ := data["request_id"].(string); cancelID != "" {
+				q.inflightMu.Lock()
+				cancel, ok := q.inflight[cancelID]
+				delete(q.inflight, cancelID)
+				q.inflightMu.Unlock()
+				if ok {
+					cancel()
+				}
+			}
+
+		case "transcript_mirror":
+			// SessionStore write path: peel mirror frames off stdout and
+			// hand them to the batcher rather than yielding to consumers.
+			if q.mirror != nil {
+				filePath, _ := data["filePath"].(string)
+				q.mirror.enqueue(filePath, data["entries"])
+			}
+
 		default:
 			msg, parseErr := parseMessage(data)
 			if parseErr != nil {
@@ -204,6 +337,12 @@ func (q *protocolQuery) readLoop(ctx context.Context) {
 			}
 
 			if _, ok := msg.(*ResultMessage); ok {
+				// Flush pending mirror entries before yielding the result,
+				// so consumers observing it can rely on the SessionStore
+				// being up to date for this turn.
+				if q.mirror != nil {
+					q.mirror.flush(ctx)
+				}
 				q.firstResultOnce.Do(func() {
 					close(q.firstResult)
 				})
@@ -245,6 +384,31 @@ func (q *protocolQuery) handleControlResponse(data map[string]any) {
 	}
 }
 
+// spawnControlRequestHandler runs a control request handler in its own
+// goroutine and tracks it so a control_cancel_request can abandon it.
+func (q *protocolQuery) spawnControlRequestHandler(ctx context.Context, data map[string]any) {
+	requestID, _ := data["request_id"].(string)
+
+	handlerCtx, cancel := context.WithCancel(ctx)
+	if requestID != "" {
+		q.inflightMu.Lock()
+		q.inflight[requestID] = cancel
+		q.inflightMu.Unlock()
+	}
+
+	go func() {
+		defer cancel()
+		defer func() {
+			if requestID != "" {
+				q.inflightMu.Lock()
+				delete(q.inflight, requestID)
+				q.inflightMu.Unlock()
+			}
+		}()
+		q.handleControlRequest(handlerCtx, data)
+	}()
+}
+
 func (q *protocolQuery) handleControlRequest(ctx context.Context, data map[string]any) {
 	requestID, _ := data["request_id"].(string)
 	reqBody, _ := data["request"].(map[string]any)
@@ -265,7 +429,13 @@ func (q *protocolQuery) handleControlRequest(ctx context.Context, data map[strin
 		respErr = fmt.Errorf("unknown control request subtype: %s", subtype)
 	}
 
-	q.sendControlResponse(ctx, requestID, response, respErr)
+	// A cancelled request has already been abandoned by the CLI, so writing
+	// a response would be answering a request nobody is waiting on.
+	if ctx.Err() != nil {
+		return
+	}
+
+	q.sendControlResponse(context.WithoutCancel(ctx), requestID, response, respErr)
 }
 
 func (q *protocolQuery) handleCanUseTool(ctx context.Context, req map[string]any) (map[string]any, error) {
@@ -276,7 +446,15 @@ func (q *protocolQuery) handleCanUseTool(ctx context.Context, req map[string]any
 	toolName, _ := req["tool_name"].(string)
 	input, _ := req["input"].(map[string]any)
 
-	permCtx := ToolPermissionContext{}
+	permCtx := ToolPermissionContext{
+		ToolUseID:      stringFromAny(req["tool_use_id"]),
+		AgentID:        stringFromAny(req["agent_id"]),
+		BlockedPath:    stringFromAny(req["blocked_path"]),
+		DecisionReason: stringFromAny(req["decision_reason"]),
+		Title:          stringFromAny(req["title"]),
+		DisplayName:    stringFromAny(req["display_name"]),
+		Description:    stringFromAny(req["description"]),
+	}
 	if suggestions, ok := req["permission_suggestions"].([]any); ok {
 		for _, s := range suggestions {
 			if sMap, ok := s.(map[string]any); ok {
@@ -426,6 +604,13 @@ func (q *protocolQuery) nextRequestID() string {
 	b := make([]byte, 4)
 	rand.Read(b)
 	return fmt.Sprintf("req_%d_%s", counter, hex.EncodeToString(b))
+}
+
+// newRequestID returns a random identifier for SDK-synthesized messages.
+func newRequestID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 func (q *protocolQuery) buildHooksConfig() map[string]any {

@@ -2,8 +2,10 @@ package agentsdk
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"iter"
+	"log"
 )
 
 // Client provides a bidirectional, interactive interface to the Claude CLI.
@@ -13,6 +15,7 @@ type Client struct {
 	opts      *ClaudeAgentOptions
 	transport Transport
 	query     *protocolQuery
+	mirror    *transcriptMirrorBatcher
 	connected bool
 
 	serverInfo map[string]any
@@ -53,11 +56,32 @@ func NewClientWithTransport(opts *ClaudeAgentOptions, t Transport) *Client {
 
 // Connect establishes the connection to the CLI and performs initialization.
 func (c *Client) Connect(ctx context.Context) error {
+	if err := configureCanUseTool(c.opts); err != nil {
+		return err
+	}
+	if warning := CanUseToolShadowedWarning(c.opts); warning != "" {
+		log.Print("agentsdk: " + warning)
+	}
+
 	if err := c.transport.Connect(ctx); err != nil {
 		return err
 	}
 
 	c.query = newProtocolQuery(c.transport, c.opts)
+
+	// Mirror transcripts to the configured store. The batcher receives the
+	// transcript_mirror frames the read loop peels off stdout.
+	if c.opts.SessionStore != nil {
+		q := c.query
+		c.mirror = newTranscriptMirrorBatcher(
+			c.opts.SessionStore,
+			projectsDir(c.opts.Env),
+			c.opts.SessionStoreFlush,
+			func(key *SessionKey, message string) { q.reportMirrorError(key, message) },
+		)
+		c.query.setMirrorBatcher(c.mirror)
+	}
+
 	c.query.Start(ctx)
 
 	initResult, err := c.query.Initialize(ctx)
@@ -117,12 +141,80 @@ func (c *Client) RewindFiles(ctx context.Context, msgID string) error {
 	return c.query.RewindFiles(ctx, msgID)
 }
 
-// McpStatus queries the MCP server status.
+// McpStatus queries the MCP server status as a raw map.
+//
+// Prefer GetMcpStatus, which decodes the same response into typed values.
 func (c *Client) McpStatus(ctx context.Context) (map[string]any, error) {
 	if !c.connected {
 		return nil, fmt.Errorf("client not connected")
 	}
 	return c.query.McpStatus(ctx)
+}
+
+// GetMcpStatus returns the status of every configured MCP server.
+func (c *Client) GetMcpStatus(ctx context.Context) (*McpStatusResponse, error) {
+	raw, err := c.McpStatus(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var status McpStatusResponse
+	if err := decodeControlResponse(raw, &status); err != nil {
+		return nil, fmt.Errorf("failed to decode MCP status response: %w", err)
+	}
+	return &status, nil
+}
+
+// GetContextUsage returns a breakdown of the current context window usage by
+// category, matching the data the CLI's /context command shows.
+func (c *Client) GetContextUsage(ctx context.Context) (*ContextUsageResponse, error) {
+	if !c.connected {
+		return nil, fmt.Errorf("client not connected")
+	}
+	raw, err := c.query.GetContextUsage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var usage ContextUsageResponse
+	if err := decodeControlResponse(raw, &usage); err != nil {
+		return nil, fmt.Errorf("failed to decode context usage response: %w", err)
+	}
+	return &usage, nil
+}
+
+// ReconnectMcpServer reconnects a disconnected or failed MCP server.
+func (c *Client) ReconnectMcpServer(ctx context.Context, serverName string) error {
+	if !c.connected {
+		return fmt.Errorf("client not connected")
+	}
+	return c.query.ReconnectMcpServer(ctx, serverName)
+}
+
+// ToggleMcpServer enables or disables an MCP server.
+func (c *Client) ToggleMcpServer(ctx context.Context, serverName string, enabled bool) error {
+	if !c.connected {
+		return fmt.Errorf("client not connected")
+	}
+	return c.query.ToggleMcpServer(ctx, serverName, enabled)
+}
+
+// StopTask stops a running task, identified by the task ID carried on
+// TaskStartedMessage and TaskNotificationMessage.
+func (c *Client) StopTask(ctx context.Context, taskID string) error {
+	if !c.connected {
+		return fmt.Errorf("client not connected")
+	}
+	return c.query.StopTask(ctx, taskID)
+}
+
+// decodeControlResponse re-encodes a control response map into a typed
+// value. The control protocol hands back generic maps, and round-tripping
+// through JSON keeps the field mapping in the struct tags.
+func decodeControlResponse(raw map[string]any, out any) error {
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(encoded, out)
 }
 
 // ServerInfo returns the initialization result from the CLI.
@@ -146,7 +238,13 @@ func (c *Client) ReceiveResponse() iter.Seq[Message] {
 }
 
 // Close disconnects from the CLI and cleans up resources.
+//
+// When a SessionStore is configured, pending transcript entries are flushed
+// before teardown so an immediate disconnect does not drop the current turn.
 func (c *Client) Close() error {
 	c.connected = false
+	if c.mirror != nil {
+		c.mirror.close()
+	}
 	return c.transport.Close()
 }

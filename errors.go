@@ -1,6 +1,9 @@
 package agentsdk
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // sdkError is the base error implementation for all SDK errors.
 type sdkError struct {
@@ -77,4 +80,114 @@ type MessageParseError struct {
 // NewMessageParseError creates a new MessageParseError.
 func NewMessageParseError(message string, data map[string]any) *MessageParseError {
 	return &MessageParseError{sdkError: newError(message, nil), Data: data}
+}
+
+// ValidationError indicates an invalid option combination or value,
+// detected before the CLI subprocess is spawned.
+type ValidationError struct {
+	sdkError
+}
+
+// NewValidationError creates a new ValidationError.
+func NewValidationError(message string) *ValidationError {
+	return &ValidationError{sdkError: newError(message, nil)}
+}
+
+// ResultError indicates the CLI exited after reporting a terminal error
+// result.
+//
+// The CLI ends a failed run by emitting a result message with is_error true
+// — yielded to the caller as a ResultMessage — and then exiting non-zero.
+// This error replaces the bare exit-code ProcessError for that case and
+// carries the result's payload, so callers can branch on why the run failed
+// without matching on strings:
+//
+//	var resErr *agentsdk.ResultError
+//	if errors.As(err, &resErr) {
+//		switch {
+//		case resErr.TerminalReason == "api_error": // overloaded, timeout
+//			retry()
+//		case resErr.Subtype == "error_max_turns":
+//			// ...
+//		}
+//	}
+//
+// It wraps a ProcessError, so errors.As for *ProcessError also matches.
+type ResultError struct {
+	*ProcessError
+
+	// Subtype is the result subtype, such as "error_max_turns" or
+	// "error_during_execution" — or "success" when the agent loop itself
+	// completed but the last turn was an API error.
+	Subtype string
+
+	// Errors are the error strings the CLI reported. It may be empty.
+	Errors []string
+
+	// Result is the result text, if any. For API failures it holds the
+	// "API Error: ..." prose.
+	Result string
+
+	// APIErrorStatus is the HTTP status of the failing API call, or zero.
+	APIErrorStatus int
+
+	// TerminalReason says why the run ended, such as "api_error" or
+	// "max_turns", when the CLI reported one.
+	TerminalReason string
+
+	// SessionID is the session the result belongs to, when reported.
+	SessionID string
+
+	// Data is the raw result message payload as the CLI emitted it.
+	Data map[string]any
+}
+
+// NewResultError creates a ResultError from a raw result message payload.
+func NewResultError(message string, data map[string]any, exitCode int) *ResultError {
+	if data == nil {
+		data = map[string]any{}
+	}
+	subtype, _ := data["subtype"].(string)
+	result, _ := data["result"].(string)
+	terminalReason, _ := data["terminal_reason"].(string)
+	sessionID, _ := data["session_id"].(string)
+
+	return &ResultError{
+		ProcessError:   NewProcessError(message, exitCode, ""),
+		Subtype:        subtype,
+		Errors:         normalizeResultErrors(data["errors"]),
+		Result:         result,
+		APIErrorStatus: intFromAny(data["api_error_status"]),
+		TerminalReason: terminalReason,
+		SessionID:      sessionID,
+		Data:           data,
+	}
+}
+
+// normalizeResultErrors normalizes a result frame's errors field to clean
+// strings. The CLI emits a list of strings; a bare string is tolerated for
+// older emitters, and non-string or blank entries are dropped so the
+// structured ResultError.Errors and the error text always agree.
+func normalizeResultErrors(raw any) []string {
+	var items []any
+	switch v := raw.(type) {
+	case string:
+		items = []any{v}
+	case []any:
+		items = v
+	default:
+		return nil
+	}
+
+	var out []string
+	for _, item := range items {
+		s, ok := item.(string)
+		if !ok {
+			continue
+		}
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }

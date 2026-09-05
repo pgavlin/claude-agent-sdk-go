@@ -3,6 +3,7 @@ package agentsdk
 import (
 	"context"
 	"iter"
+	"log"
 )
 
 // Query sends a one-shot prompt to the Claude CLI and returns an iterator
@@ -26,6 +27,14 @@ func Query(ctx context.Context, prompt string, opts *ClaudeAgentOptions) (iter.S
 	var finalErr error
 
 	seq := func(yield func(Message) bool) {
+		if err := configureCanUseTool(opts); err != nil {
+			finalErr = err
+			return
+		}
+		if warning := CanUseToolShadowedWarning(opts); warning != "" {
+			log.Print("agentsdk: " + warning)
+		}
+
 		transport := NewSubprocessTransport(opts, "sdk-go")
 
 		if err := transport.Connect(ctx); err != nil {
