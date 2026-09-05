@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Go SDK for the Claude Code CLI (`github.com/pgavlin/claude-agent-sdk-go`, package `agentsdk`). Ported from the upstream [Python SDK](https://github.com/anthropics/claude-agent-sdk-python) (synced to version in `UPSTREAM_VERSION`). Go 1.23+ (uses `iter.Seq`). One dependency, `golang.org/x/text`, pinned to v0.25.0 — the last release whose own `go` directive stays at 1.23, so the CI matrix keeps working. It supplies NFC path normalization and NFKC tag folding; both are load-bearing for matching the CLI's on-disk layout, so do not swap them for hand-rolled approximations. Communicates with the Claude CLI over stdin/stdout using newline-delimited JSON.
+Go SDK for the Claude Code CLI (`github.com/pgavlin/claude-agent-sdk-go`, package `agentsdk`). Ported from the upstream [Python SDK](https://github.com/anthropics/claude-agent-sdk-python) (synced to version in `UPSTREAM_VERSION`). Go 1.25+ (uses `iter.Seq`). One dependency, `golang.org/x/text`, supplying NFC path normalization and NFKC tag folding; both are load-bearing for matching the CLI's on-disk layout, so do not swap them for hand-rolled approximations. Communicates with the Claude CLI over stdin/stdout using newline-delimited JSON.
 
 ## Commands
 
@@ -22,7 +22,7 @@ Some integration tests require a real Claude CLI install and are gated behind `A
 
 Three GitHub Actions workflows in `.github/workflows/`:
 
-- **CI** (`ci.yml`): Runs on every push/PR. Matrix: Go 1.23 + 1.24. Steps: gofumpt check, `go vet`, `go build`, `go test -race`.
+- **CI** (`ci.yml`): Runs on every push/PR. Matrix: Go 1.25 + 1.26. Steps: gofumpt check, `go vet`, `go build`, `go test -race`.
 - **Integration Tests** (`integration.yml`): Daily schedule + manual dispatch. Installs the real Claude CLI via npm, runs `go test -race -run 'RealCLI'` with `AGENTSDK_TEST_REAL_CLI=1` and an API key.
 - **Upstream Sync** (`upstream-sync.yml`): Daily schedule + manual dispatch. Compares `UPSTREAM_VERSION` against the latest `anthropics/claude-agent-sdk-python` release and opens/updates a GitHub issue when they diverge.
 
@@ -64,7 +64,7 @@ User Code
 - **Test helpers**: `TestMain` in `integration_test.go` intercepts subprocess re-invocations via `AGENTSDK_TEST_HELPER` env var to simulate the CLI (modes: `fake-cli`, `echo-json`, `version`, etc.). `chanTransport` in `protocol_test.go` provides an in-memory mock transport.
 - **CanUseTool callback**: When set on options, `configureCanUseTool` sets `PermissionPromptToolName = "stdio"` (and rejects the combination with an explicit prompt-tool name). The callback receives tool name, input, and permission context; returns `PermissionAllow` or `PermissionDeny`. `CanUseToolShadowedWarning` reports options that auto-approve tools before the callback runs.
 - **Transcript byte shape**: Go sorts map keys when marshaling, but the CLI writes `"type"` first and the lite parse scans for a `{"type":"tag"` line prefix. Every transcript writer goes through `marshalTypeFirst` so the two agree.
-- **Unicode normalization**: `normalizePath` (NFC) is applied wherever a path becomes a project key — `claudeConfigHomeDir`, `projectsDir`, `canonicalizePath`, and the worktree scan — because `sanitizePath` maps every non-alphanumeric rune to a hyphen, so a decomposed path yields a *different* key than its composed twin and the session would be invisible. `sanitizeUnicode` (NFKC) folds compatibility forms in tags and strips Cf/Co/Cs/Cn, looping to a fixed point since one pass can expose new characters. Go has no `Cn` table, so unassigned code points are detected as "in none of L/M/N/P/S/Z/C".
+- **Unicode normalization**: `normalizePath` (NFC) is applied wherever a path becomes a project key — `claudeConfigHomeDir`, `projectsDir`, `canonicalizePath`, and the worktree scan — because `sanitizePath` maps every non-alphanumeric rune to a hyphen, so a decomposed path yields a *different* key than its composed twin and the session would be invisible. `sanitizeUnicode` (NFKC) folds compatibility forms in tags and strips Cf/Co/Cs/Cn, looping to a fixed point since one pass can expose new characters. Unassigned code points use `unicode.Cn` directly — they cannot be derived from the one-letter aggregates, because `unicode.C` is generated to include unassigned ranges, so membership in it says nothing about whether a rune is assigned.
 - **Remaining deviations from upstream**: no OpenTelemetry span injection (`TRACEPARENT`/`TRACESTATE` are inherited from the process environment instead), and in-process SDK MCP servers are out of scope, since they would require an MCP server dependency.
 
 ## Examples

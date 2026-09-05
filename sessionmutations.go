@@ -654,31 +654,18 @@ var unicodeStripRe = regexp.MustCompile("[" +
 	"\ue000-\uf8ff" + // Basic Multilingual Plane private use
 	"]")
 
-// assignedCategories are the Unicode general-category aggregates covering
-// every assigned code point. A rune in none of them is unassigned, which is
-// category Cn — the standard library has no table for Cn, because unassigned
-// code points appear in no table by construction.
-var assignedCategories = []*unicode.RangeTable{
-	unicode.L, unicode.M, unicode.N, unicode.P, unicode.S, unicode.Z, unicode.C,
-}
-
 // isStrippedCategory reports whether a rune belongs to a category that tag
 // sanitization removes: Cf (format), Co (private use), Cs (surrogate), or Cn
 // (unassigned).
 //
 // These are the categories most readily abused for display spoofing and
 // injection, and they match the set the Python and TypeScript SDKs strip.
+//
+// Cn cannot be derived from the one-letter aggregates: unicode.C is
+// generated to include unassigned ranges, so membership in it says nothing
+// about whether a rune is assigned. unicode.Cn names the set exactly.
 func isStrippedCategory(r rune) bool {
-	if unicode.In(r, unicode.Cf, unicode.Co, unicode.Cs) {
-		return true
-	}
-	for _, table := range assignedCategories {
-		if unicode.Is(table, r) {
-			return false
-		}
-	}
-	// In no assigned category, so Cn.
-	return true
+	return unicode.In(r, unicode.Cf, unicode.Co, unicode.Cs, unicode.Cn)
 }
 
 // sanitizeUnicodeMaxIterations bounds the normalize-and-strip loop. A single

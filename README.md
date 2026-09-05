@@ -8,7 +8,7 @@ The only dependency is `golang.org/x/text`, for the Unicode normalization the se
 
 ## Requirements
 
-- Go 1.23+
+- Go 1.25+
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) 2.0+
 
 ## Installation
