@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"iter"
 	"log"
+	"path/filepath"
 )
 
 // Client provides a bidirectional, interactive interface to the Claude CLI.
@@ -17,6 +18,15 @@ type Client struct {
 	query     *protocolQuery
 	mirror    *transcriptMirrorBatcher
 	connected bool
+
+	// ownsTransport records that the client built the default subprocess
+	// transport itself, so it may rebuild it after a store-backed resume
+	// repoints the options at a temporary config directory.
+	ownsTransport bool
+
+	// materialized holds the temporary config directory a store-backed
+	// resume wrote, to be cleaned up on Close.
+	materialized *MaterializedResume
 
 	serverInfo map[string]any
 }
@@ -33,8 +43,9 @@ func NewClient(opts *ClaudeAgentOptions) *Client {
 	}
 
 	return &Client{
-		opts:      opts,
-		transport: NewSubprocessTransport(opts, "sdk-go-client"),
+		opts:          opts,
+		transport:     NewSubprocessTransport(opts, "sdk-go-client"),
+		ownsTransport: true,
 	}
 }
 
@@ -63,7 +74,23 @@ func (c *Client) Connect(ctx context.Context) error {
 		log.Print("agentsdk: " + warning)
 	}
 
+	// A store-backed resume has no local transcript to resume from, so
+	// materialize one into a temporary config directory and repoint the
+	// options at it before spawning.
+	materialized, err := MaterializeResumeSession(ctx, c.opts)
+	if err != nil {
+		return err
+	}
+	if materialized != nil {
+		c.materialized = materialized
+		c.opts = ApplyMaterializedOptions(c.opts, materialized)
+		if c.ownsTransport {
+			c.transport = NewSubprocessTransport(c.opts, "sdk-go-client")
+		}
+	}
+
 	if err := c.transport.Connect(ctx); err != nil {
+		c.cleanupMaterialized()
 		return err
 	}
 
@@ -73,9 +100,16 @@ func (c *Client) Connect(ctx context.Context) error {
 	// transcript_mirror frames the read loop peels off stdout.
 	if c.opts.SessionStore != nil {
 		q := c.query
+		// Resolve the projects directory to the materialized temporary
+		// directory when there is one, so file-path-to-key resolution
+		// matches what the subprocess actually writes.
+		mirrorProjectsDir := projectsDir(c.opts.Env)
+		if c.materialized != nil {
+			mirrorProjectsDir = filepath.Join(c.materialized.ConfigDir, "projects")
+		}
 		c.mirror = newTranscriptMirrorBatcher(
 			c.opts.SessionStore,
-			projectsDir(c.opts.Env),
+			mirrorProjectsDir,
 			c.opts.SessionStoreFlush,
 			func(key *SessionKey, message string) { q.reportMirrorError(key, message) },
 		)
@@ -87,6 +121,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	initResult, err := c.query.Initialize(ctx)
 	if err != nil {
 		c.transport.Close()
+		c.cleanupMaterialized()
 		return err
 	}
 
@@ -246,5 +281,16 @@ func (c *Client) Close() error {
 	if c.mirror != nil {
 		c.mirror.close()
 	}
-	return c.transport.Close()
+	err := c.transport.Close()
+	c.cleanupMaterialized()
+	return err
+}
+
+// cleanupMaterialized removes the temporary config directory a store-backed
+// resume created, if any.
+func (c *Client) cleanupMaterialized() {
+	if c.materialized != nil {
+		c.materialized.Cleanup()
+		c.materialized = nil
+	}
 }

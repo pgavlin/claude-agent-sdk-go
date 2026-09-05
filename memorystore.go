@@ -84,7 +84,7 @@ func (s *InMemorySessionStore) Append(_ context.Context, key SessionKey, entries
 	defer s.mu.Unlock()
 
 	k := keyToString(key)
-	s.store[k] = append(s.store[k], entries...)
+	s.store[k] = append(s.store[k], cloneEntries(entries)...)
 	nowMS := s.nextMtime()
 
 	// Maintain the per-session summary sidecar incrementally so
@@ -121,7 +121,7 @@ func (s *InMemorySessionStore) Load(_ context.Context, key SessionKey) ([]Sessio
 	if !ok {
 		return nil, nil
 	}
-	return append([]SessionStoreEntry(nil), entries...), nil
+	return cloneEntries(entries), nil
 }
 
 // ListSessions implements SessionLister.
@@ -215,7 +215,11 @@ func (s *InMemorySessionStore) ListSubkeys(_ context.Context, key SessionListSub
 func (s *InMemorySessionStore) Entries(key SessionKey) []SessionStoreEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]SessionStoreEntry{}, s.store[keyToString(key)]...)
+	entries := cloneEntries(s.store[keyToString(key)])
+	if entries == nil {
+		return []SessionStoreEntry{}
+	}
+	return entries
 }
 
 // Size returns the number of stored sessions, counting main transcripts
@@ -243,4 +247,51 @@ func (s *InMemorySessionStore) Clear() {
 	s.summaries = map[summaryKey]SessionSummaryEntry{}
 	s.order = nil
 	s.lastMtime = 0
+}
+
+// cloneEntries deep-copies entries so the store and its callers never share
+// mutable state.
+//
+// Real backends serialize on write and deserialize on read, so a caller that
+// mutates a loaded entry cannot corrupt what is stored. Copying here gives
+// the in-memory store the same isolation, which keeps tests written against
+// it faithful to production adapters.
+func cloneEntries(entries []SessionStoreEntry) []SessionStoreEntry {
+	if entries == nil {
+		return nil
+	}
+	out := make([]SessionStoreEntry, len(entries))
+	for i, entry := range entries {
+		out[i] = SessionStoreEntry(cloneJSONMap(entry))
+	}
+	return out
+}
+
+// cloneJSONMap deep-copies a decoded JSON object. Values that are not maps or
+// slices are immutable in Go and are shared as-is.
+func cloneJSONMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = cloneJSONValue(v)
+	}
+	return out
+}
+
+// cloneJSONValue deep-copies a decoded JSON value.
+func cloneJSONValue(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		return cloneJSONMap(val)
+	case []any:
+		out := make([]any, len(val))
+		for i, item := range val {
+			out[i] = cloneJSONValue(item)
+		}
+		return out
+	default:
+		return val
+	}
 }

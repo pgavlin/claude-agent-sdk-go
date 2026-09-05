@@ -4,6 +4,7 @@ import (
 	"context"
 	"iter"
 	"log"
+	"path/filepath"
 )
 
 // Query sends a one-shot prompt to the Claude CLI and returns an iterator
@@ -35,7 +36,21 @@ func Query(ctx context.Context, prompt string, opts *ClaudeAgentOptions) (iter.S
 			log.Print("agentsdk: " + warning)
 		}
 
-		transport := NewSubprocessTransport(opts, "sdk-go")
+		// A store-backed resume has no local transcript to resume from, so
+		// materialize one into a temporary config directory and repoint the
+		// options at it before spawning.
+		materialized, err := MaterializeResumeSession(ctx, opts)
+		if err != nil {
+			finalErr = err
+			return
+		}
+		effectiveOpts := opts
+		if materialized != nil {
+			defer materialized.Cleanup()
+			effectiveOpts = ApplyMaterializedOptions(opts, materialized)
+		}
+
+		transport := NewSubprocessTransport(effectiveOpts, "sdk-go")
 
 		if err := transport.Connect(ctx); err != nil {
 			finalErr = err
@@ -43,7 +58,26 @@ func Query(ctx context.Context, prompt string, opts *ClaudeAgentOptions) (iter.S
 		}
 		defer transport.Close()
 
-		q := newProtocolQuery(transport, opts)
+		q := newProtocolQuery(transport, effectiveOpts)
+
+		// Mirror transcripts to the configured store, resolving the
+		// projects directory to the materialized temporary directory when
+		// there is one so file-path-to-key resolution matches what the
+		// subprocess writes.
+		if effectiveOpts.SessionStore != nil {
+			mirrorProjectsDir := projectsDir(effectiveOpts.Env)
+			if materialized != nil {
+				mirrorProjectsDir = filepath.Join(materialized.ConfigDir, "projects")
+			}
+			mirror := newTranscriptMirrorBatcher(
+				effectiveOpts.SessionStore,
+				mirrorProjectsDir,
+				effectiveOpts.SessionStoreFlush,
+				func(key *SessionKey, message string) { q.reportMirrorError(key, message) },
+			)
+			q.setMirrorBatcher(mirror)
+			defer mirror.close()
+		}
 		q.Start(ctx)
 
 		if _, err := q.Initialize(ctx); err != nil {

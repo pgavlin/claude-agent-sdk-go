@@ -709,7 +709,7 @@ func parseSemver(s string) []int {
 // and control characters, which never appear in a skill directory name.
 // U+FEFF is here rather than with the whitespace check below because the CLI
 // trims it as whitespace and Go's strings.TrimSpace does not.
-var skillNameInvalidChars = regexp.MustCompile("[(),\x00-\x1f\x7f-\x9f\uFEFF]")
+var skillNameInvalidChars = regexp.MustCompile("[(),\u0000-\u001f\u007f-\u009f\ufeff]")
 
 // validateSkillName rejects skill names that cannot ride safely in a
 // Skill(name) rule.

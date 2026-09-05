@@ -48,8 +48,11 @@ func TestBuildArgs_SystemPromptPresetNoAppend(t *testing.T) {
 	}, "sdk-go")
 	args := tr.BuildArgs()
 
-	if containsArg(args, "--system-prompt") || containsArg(args, "--append-system-prompt") {
-		t.Error("expected no system prompt flags for preset without append")
+	if containsArg(args, "--append-system-prompt") {
+		t.Error("expected no --append-system-prompt for a preset without an append")
+	}
+	if containsArg(args, "--system-prompt") {
+		t.Error("expected no --system-prompt for a preset")
 	}
 }
 
@@ -116,7 +119,9 @@ func TestBuildArgs_Resume(t *testing.T) {
 	}, "sdk-go")
 	args := tr.BuildArgs()
 
-	assertArgPair(t, args, "--resume", "session-123")
+	// The equals form binds the value so it can never be parsed as a
+	// separate flag.
+	assertArgContains(t, args, "--resume=session-123")
 }
 
 func TestBuildArgs_AllowedTools(t *testing.T) {
@@ -212,14 +217,30 @@ func TestBuildArgs_SettingSources(t *testing.T) {
 	}, "sdk-go")
 	args := tr.BuildArgs()
 
-	assertArgPair(t, args, "--setting-sources", "user,project")
+	assertArgContains(t, args, "--setting-sources=user,project")
 }
 
 func TestBuildArgs_SettingSourcesNil(t *testing.T) {
 	tr := NewSubprocessTransport(&ClaudeAgentOptions{}, "sdk-go")
 	args := tr.BuildArgs()
 
-	assertArgPair(t, args, "--setting-sources", "")
+	// An unset SettingSources omits the flag so the CLI applies its own
+	// defaults, rather than sending an empty value that disables them.
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--setting-sources") {
+			t.Errorf("expected no --setting-sources flag, got %q", arg)
+		}
+	}
+}
+
+func TestBuildArgs_SettingSourcesEmpty(t *testing.T) {
+	tr := NewSubprocessTransport(&ClaudeAgentOptions{
+		SettingSources: []SettingSource{},
+	}, "sdk-go")
+	args := tr.BuildArgs()
+
+	// An empty non-nil slice disables filesystem settings.
+	assertArgContains(t, args, "--setting-sources=")
 }
 
 func TestBuildArgs_ExtraArgs(t *testing.T) {
@@ -275,7 +296,17 @@ func TestBuildArgs_ThinkingAdaptive(t *testing.T) {
 	}, "sdk-go")
 	args := tr.BuildArgs()
 
-	assertArgPair(t, args, "--max-thinking-tokens", "32000")
+	assertArgPair(t, args, "--thinking", "adaptive")
+}
+
+func TestBuildArgs_ThinkingAdaptiveWithDisplay(t *testing.T) {
+	tr := NewSubprocessTransport(&ClaudeAgentOptions{
+		Thinking: ThinkingConfigAdaptive{Display: ThinkingDisplaySummarized},
+	}, "sdk-go")
+	args := tr.BuildArgs()
+
+	assertArgPair(t, args, "--thinking", "adaptive")
+	assertArgPair(t, args, "--thinking-display", "summarized")
 }
 
 func TestBuildArgs_ThinkingEnabled(t *testing.T) {
@@ -293,7 +324,7 @@ func TestBuildArgs_ThinkingDisabled(t *testing.T) {
 	}, "sdk-go")
 	args := tr.BuildArgs()
 
-	assertArgPair(t, args, "--max-thinking-tokens", "0")
+	assertArgPair(t, args, "--thinking", "disabled")
 }
 
 func TestBuildArgs_MaxThinkingTokensLegacy(t *testing.T) {
@@ -314,14 +345,18 @@ func TestBuildArgs_ThinkingOverridesLegacy(t *testing.T) {
 	}, "sdk-go")
 	args := tr.BuildArgs()
 
-	// Thinking config should take precedence
-	assertArgPair(t, args, "--max-thinking-tokens", "0")
+	// The thinking config takes precedence over the deprecated budget.
+	assertArgPair(t, args, "--thinking", "disabled")
+	if containsArg(args, "--max-thinking-tokens") {
+		t.Error("expected no --max-thinking-tokens when Thinking is set")
+	}
 }
 
 func TestBuildArgs_OutputFormat(t *testing.T) {
 	tr := NewSubprocessTransport(&ClaudeAgentOptions{
 		OutputFormat: &OutputFormat{
-			JSONSchema: map[string]any{
+			Type: "json_schema",
+			Schema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"answer": map[string]any{"type": "string"},
@@ -426,4 +461,15 @@ func assertArgPair(t *testing.T, args []string, flag, value string) {
 	if args[idx+1] != value {
 		t.Errorf("expected %q %q, got %q %q", flag, value, flag, args[idx+1])
 	}
+}
+
+// assertArgContains fails unless args contains an exact match for want.
+func assertArgContains(t *testing.T, args []string, want string) {
+	t.Helper()
+	for _, arg := range args {
+		if arg == want {
+			return
+		}
+	}
+	t.Errorf("expected argument %q in %v", want, args)
 }
