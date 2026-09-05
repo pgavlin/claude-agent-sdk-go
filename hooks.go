@@ -36,6 +36,24 @@ type BaseHookFields struct {
 	PermissionMode string `json:"permission_mode,omitempty"`
 }
 
+// SubagentContext carries optional sub-agent attribution on tool-lifecycle
+// hook inputs.
+//
+// AgentID is present only when the hook fires from inside a Task-spawned
+// sub-agent, and is empty on the main thread. It matches the AgentID emitted
+// by that sub-agent's SubagentStart and SubagentStop hooks. When several
+// sub-agents run in parallel their tool-lifecycle hooks interleave over the
+// same control channel, so this is the only reliable way to attribute each
+// one to the correct sub-agent.
+//
+// AgentType is the agent type name, e.g. "general-purpose" or
+// "code-reviewer". It is present inside a sub-agent, alongside AgentID, or on
+// the main thread of a session started with --agent, without an AgentID.
+type SubagentContext struct {
+	AgentID   string `json:"agent_id,omitempty"`
+	AgentType string `json:"agent_type,omitempty"`
+}
+
 // HookInput is a sealed interface for hook event inputs.
 type HookInput interface {
 	hookEventName() HookEvent
@@ -45,6 +63,7 @@ type HookInput interface {
 // PreToolUseHookInput is sent before a tool is used.
 type PreToolUseHookInput struct {
 	BaseHookFields
+	SubagentContext
 	ToolName  string         `json:"tool_name"`
 	ToolInput map[string]any `json:"tool_input"`
 	ToolUseID string         `json:"tool_use_id"`
@@ -56,6 +75,7 @@ func (h PreToolUseHookInput) BaseFields() BaseHookFields { return h.BaseHookFiel
 // PostToolUseHookInput is sent after a tool is used successfully.
 type PostToolUseHookInput struct {
 	BaseHookFields
+	SubagentContext
 	ToolName     string         `json:"tool_name"`
 	ToolInput    map[string]any `json:"tool_input"`
 	ToolResponse any            `json:"tool_response"`
@@ -68,6 +88,7 @@ func (h PostToolUseHookInput) BaseFields() BaseHookFields { return h.BaseHookFie
 // PostToolUseFailureHookInput is sent after a tool use fails.
 type PostToolUseFailureHookInput struct {
 	BaseHookFields
+	SubagentContext
 	ToolName    string         `json:"tool_name"`
 	ToolInput   map[string]any `json:"tool_input"`
 	ToolUseID   string         `json:"tool_use_id"`
@@ -142,6 +163,7 @@ func (h SubagentStartHookInput) BaseFields() BaseHookFields { return h.BaseHookF
 // PermissionRequestHookInput is sent when a permission request is made.
 type PermissionRequestHookInput struct {
 	BaseHookFields
+	SubagentContext
 	ToolName              string         `json:"tool_name"`
 	ToolInput             map[string]any `json:"tool_input"`
 	PermissionSuggestions []any          `json:"permission_suggestions,omitempty"`

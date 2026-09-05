@@ -473,8 +473,8 @@ func TestSubprocessTransport_CheckVersion_TooOld(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for version 1.9.0")
 	}
-	if !strings.Contains(err.Error(), "below minimum") {
-		t.Errorf("expected 'below minimum' in error, got: %v", err)
+	if !strings.Contains(err.Error(), "is unsupported in the Agent SDK") {
+		t.Errorf("expected an unsupported-version message, got: %v", err)
 	}
 }
 
