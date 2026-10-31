@@ -1,5 +1,10 @@
 package agentsdk
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 // Message is a sealed interface representing a message in the conversation.
 // Discriminated by the "type" field in JSON.
 type Message interface {
@@ -163,12 +168,141 @@ func (AssistantMessage) messageType() string { return "assistant" }
 // Python SDK, where those are subclasses, a Go type switch on *SystemMessage
 // will not match them — switch on the specific type, or read the embedded
 // SystemMessage field for the raw Subtype and Data.
+//
+// For Subtype "init", Data is the session metadata described by
+// SystemInitData; decode it with InitData.
 type SystemMessage struct {
 	Subtype string         `json:"subtype"`
 	Data    map[string]any `json:"data"`
 }
 
 func (SystemMessage) messageType() string { return "system" }
+
+// InitData decodes Data as the payload of a system/init message. It returns
+// an error if Subtype is not "init" or Data does not have the expected shape.
+// The parser does not validate the payload, so the result describes what the
+// CLI sent rather than a guarantee.
+func (m *SystemMessage) InitData() (*SystemInitData, error) {
+	if m.Subtype != "init" {
+		return nil, fmt.Errorf("system message subtype is %q, not \"init\"", m.Subtype)
+	}
+	raw, err := json.Marshal(m.Data)
+	if err != nil {
+		return nil, err
+	}
+	var data SystemInitData
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return nil, fmt.Errorf("decoding system/init data: %w", err)
+	}
+	return &data, nil
+}
+
+// SystemInitData is the session metadata the CLI sends at the start of each
+// turn as a system/init message: model, working directory, tools, MCP
+// servers, slash commands, permission mode, and the capabilities list for
+// feature detection. Field names match the wire format. Use
+// SystemMessage.InitData to decode it.
+type SystemInitData struct {
+	Type      string   `json:"type"`
+	Subtype   string   `json:"subtype"`
+	UUID      string   `json:"uuid"`
+	SessionID string   `json:"session_id"`
+	Agents    []string `json:"agents,omitempty"`
+	// APIKeySource is where the API credential came from:
+	// "ANTHROPIC_API_KEY", "apiKeyHelper", "/login managed key", or "none"
+	// (no API key in use, e.g. a claude.ai login or a third-party cloud
+	// provider).
+	APIKeySource      string                `json:"apiKeySource"`
+	Betas             []string              `json:"betas,omitempty"`
+	ClaudeCodeVersion string                `json:"claude_code_version"`
+	CWD               string                `json:"cwd"`
+	Tools             []string              `json:"tools"`
+	McpServers        []SystemInitMcpServer `json:"mcp_servers"`
+	Model             string                `json:"model"`
+	PermissionMode    PermissionMode        `json:"permissionMode"`
+	SlashCommands     []string              `json:"slash_commands"`
+	// TerminalSlashCommands are the entries of SlashCommands whose
+	// interface is bound to the local terminal (e.g. "exit"). Present only
+	// when non-empty.
+	TerminalSlashCommands []string           `json:"terminal_slash_commands,omitempty"`
+	OutputStyle           string             `json:"output_style"`
+	Skills                []string           `json:"skills"`
+	Plugins               []SystemInitPlugin `json:"plugins"`
+	// PluginErrors lists plugin load failures. The CLI omits it when
+	// nothing failed, but its absence does not by itself assert a clean
+	// load: older CLIs and some hosted sessions never send it.
+	PluginErrors  []SystemInitPluginError `json:"plugin_errors,omitempty"`
+	FastModeState FastModeState           `json:"fast_mode_state,omitempty"`
+	// FastModeDisabledReason names the check that blocks fast mode, when
+	// something does.
+	FastModeDisabledReason FastModeDisabledReason `json:"fast_mode_disabled_reason,omitempty"`
+	// Capabilities lists protocol capabilities the CLI supports (e.g.
+	// "interrupt_receipt_v1"), for feature detection instead of comparing
+	// ClaudeCodeVersion. It is an open set: ignore unrecognized values.
+	// Absent on CLIs before 2.1.205.
+	Capabilities []string `json:"capabilities,omitempty"`
+}
+
+// SystemInitMcpServer is an MCP server listed in SystemInitData.
+type SystemInitMcpServer struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	// Source is where the server definition came from: "sdk", "plugin", or
+	// a config scope such as "user" or "project". Empty on CLIs that predate
+	// the field.
+	Source string `json:"source,omitempty"`
+}
+
+// SystemInitPlugin is a loaded plugin listed in SystemInitData.
+type SystemInitPlugin struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+	// Version is the version declared in the plugin's manifest, verbatim.
+	// Empty when the manifest declares none.
+	Version string `json:"version,omitempty"`
+}
+
+// SystemInitPluginError is a plugin load failure listed in SystemInitData.
+type SystemInitPluginError struct {
+	// Plugin is "name@marketplace", or a positional tag such as "inline[0]"
+	// or "synced[0]" when a directory entry failed before it had a name.
+	Plugin string `json:"plugin"`
+	// Type is a failure category from an open set (e.g. "path-not-found",
+	// "manifest-validation-error"). Treat unknown values as a generic
+	// failure.
+	Type    string `json:"type"`
+	Message string `json:"message"`
+	// Path is set only when a plugins, --plugin-dir or synced directory
+	// entry did not load at all: that entry's path, resolved against the
+	// cwd. Use it to match a positional Plugin tag to the entry.
+	Path string `json:"path,omitempty"`
+}
+
+// FastModeState is the fast mode state reported in SystemInitData.
+type FastModeState string
+
+const (
+	FastModeOff      FastModeState = "off"
+	FastModeCooldown FastModeState = "cooldown"
+	FastModeOn       FastModeState = "on"
+)
+
+// FastModeDisabledReason is why fast mode cannot serve right now, as reported
+// in SystemInitData. Newer CLIs may send values not listed here.
+type FastModeDisabledReason string
+
+const (
+	FastModeDisabledFree               FastModeDisabledReason = "free"
+	FastModeDisabledPreference         FastModeDisabledReason = "preference"
+	FastModeDisabledExtraUsageDisabled FastModeDisabledReason = "extra_usage_disabled"
+	FastModeDisabledNetworkError       FastModeDisabledReason = "network_error"
+	FastModeDisabledUnknown            FastModeDisabledReason = "unknown"
+	FastModeDisabledNotFirstParty      FastModeDisabledReason = "not_first_party"
+	FastModeDisabledByEnv              FastModeDisabledReason = "disabled_by_env"
+	FastModeDisabledModelNotAllowed    FastModeDisabledReason = "model_not_allowed"
+	FastModeDisabledSDKOptInRequired   FastModeDisabledReason = "sdk_opt_in_required"
+	FastModeDisabledPending            FastModeDisabledReason = "pending"
+)
 
 // TaskUsage reports usage statistics carried by task_progress and
 // task_notification messages.

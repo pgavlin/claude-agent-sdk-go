@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -45,8 +46,9 @@ type protocolQuery struct {
 	// configured. It is nil otherwise.
 	mirror *transcriptMirrorBatcher
 
-	firstResult     chan struct{}
-	firstResultOnce sync.Once
+	// run tracks whether the run is over, so stdin can stay open while the
+	// CLI may still send control requests.
+	run *runState
 }
 
 type controlResult struct {
@@ -66,7 +68,7 @@ func newProtocolQuery(transport Transport, opts *ClaudeAgentOptions) *protocolQu
 		pending:       make(map[string]chan controlResult),
 		hookCallbacks: make(map[string]HookCallback),
 		inflight:      make(map[string]context.CancelFunc),
-		firstResult:   make(chan struct{}),
+		run:           newRunState(runEndCeilingMS(opts.Env), hasBidirectionalNeeds(opts)),
 	}
 }
 
@@ -94,8 +96,18 @@ func (q *protocolQuery) Initialize(ctx context.Context) (map[string]any, error) 
 		request["agents"] = q.opts.Agents
 	}
 
-	if preset, ok := q.opts.SystemPrompt.(*SystemPromptPreset); ok && preset.ExcludeDynamicSections != nil {
-		request["excludeDynamicSections"] = *preset.ExcludeDynamicSections
+	switch sp := q.opts.SystemPrompt.(type) {
+	case *SystemPromptPreset:
+		if sp.ExcludeDynamicSections != nil {
+			request["excludeDynamicSections"] = *sp.ExcludeDynamicSections
+		}
+		if sp.Snapshot != nil {
+			request["systemPromptSnapshot"] = *sp.Snapshot
+		}
+	case *SystemPromptCustom:
+		if sp.Snapshot != nil {
+			request["systemPromptSnapshot"] = *sp.Snapshot
+		}
 	}
 
 	// SkillsAll and an omitted value are equivalent on the wire, since
@@ -239,6 +251,11 @@ func (q *protocolQuery) WriteUserMessage(ctx context.Context, prompt string, ses
 		"message":            map[string]any{"role": "user", "content": prompt},
 		"parent_tool_use_id": nil,
 	}
+	if q.opts.VerbatimPrompts {
+		// Deliver the text as written: no @path expansion and no
+		// slash-command dispatch.
+		msg["client_composed"] = true
+	}
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal user message: %w", err)
@@ -246,19 +263,34 @@ func (q *protocolQuery) WriteUserMessage(ctx context.Context, prompt string, ses
 	return q.transport.Write(ctx, string(data))
 }
 
-func (q *protocolQuery) EndInput() error {
-	return q.transport.EndInput()
+// hasBidirectionalNeeds reports whether the CLI may send control requests
+// that need a reply over stdin.
+func hasBidirectionalNeeds(opts *ClaudeAgentOptions) bool {
+	return len(opts.Hooks) != 0 || opts.CanUseTool != nil
 }
 
-func (q *protocolQuery) WaitForFirstResult(ctx context.Context) error {
-	select {
-	case <-q.firstResult:
-		return nil
-	case <-q.readDone:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+// WaitForRunEndAndEndInput closes stdin once the run is over.
+//
+// When hooks or a CanUseTool callback need replies over stdin, it first waits
+// for the end of the run: the CLI's "idle" session state after a result, or,
+// from a CLI that reports no session state, the first result with no tracked
+// background agents in flight. A result ends a turn, not necessarily the run:
+// a background agent keeps running past it, or has just finished and still
+// wakes the session for a follow-up turn whose control requests need stdin.
+//
+// The wait between turns is bounded: if the CLI still reports "running"
+// CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS (10 minutes by default, 0 for no
+// limit) after a result with no new turn, the run ends anyway. A turn under
+// way, a request still being answered, and a tracked background agent still
+// in flight stop that clock. The wait also ends if the read loop exits.
+func (q *protocolQuery) WaitForRunEndAndEndInput(ctx context.Context) error {
+	if hasBidirectionalNeeds(q.opts) {
+		if err := q.run.wait(ctx); err != nil {
+			return err
+		}
 	}
+	q.run.finish()
+	return q.transport.EndInput()
 }
 
 func (q *protocolQuery) Done() <-chan struct{} {
@@ -270,15 +302,12 @@ func (q *protocolQuery) readLoop(ctx context.Context) {
 	defer close(q.messages)
 	// Flush any remaining mirror entries before closing, so an early stdout
 	// EOF or transport error does not drop entries batched this turn. Also
-	// unblock any waiter on the first result so it does not stall for the
-	// full timeout on an early exit.
+	// end the run so a waiter does not stall on an early exit.
 	defer func() {
 		if q.mirror != nil {
 			q.mirror.flush(context.WithoutCancel(ctx))
 		}
-		q.firstResultOnce.Do(func() {
-			close(q.firstResult)
-		})
+		q.run.finish()
 	}()
 
 	for data, err := range q.transport.ReadMessages(ctx) {
@@ -324,6 +353,17 @@ func (q *protocolQuery) readLoop(ctx context.Context) {
 			}
 
 		default:
+			switch msgType {
+			case "system":
+				if q.run.observeSystem(data) {
+					continue
+				}
+			case "assistant", "stream_event":
+				if data["parent_tool_use_id"] == nil {
+					q.run.observeTurnActivity()
+				}
+			}
+
 			msg, parseErr := parseMessage(data)
 			if parseErr != nil {
 				q.messages <- &SystemMessage{
@@ -343,9 +383,7 @@ func (q *protocolQuery) readLoop(ctx context.Context) {
 				if q.mirror != nil {
 					q.mirror.flush(ctx)
 				}
-				q.firstResultOnce.Do(func() {
-					close(q.firstResult)
-				})
+				q.run.observeResult()
 			}
 
 			q.messages <- msg
@@ -696,75 +734,47 @@ func parseHookInput(v any) (HookInput, error) {
 		return nil, fmt.Errorf("hook input is not a map")
 	}
 
-	base := BaseHookFields{}
-	base.SessionID, _ = data["session_id"].(string)
-	base.TranscriptPath, _ = data["transcript_path"].(string)
-	base.CWD, _ = data["cwd"].(string)
-	base.PermissionMode, _ = data["permission_mode"].(string)
-
 	eventName, _ := data["hook_event_name"].(string)
 	switch HookEvent(eventName) {
 	case HookEventPreToolUse:
-		input := PreToolUseHookInput{BaseHookFields: base}
-		input.ToolName, _ = data["tool_name"].(string)
-		input.ToolInput, _ = data["tool_input"].(map[string]any)
-		input.ToolUseID, _ = data["tool_use_id"].(string)
-		return input, nil
+		return decodeHookInput[PreToolUseHookInput](data)
 	case HookEventPostToolUse:
-		input := PostToolUseHookInput{BaseHookFields: base}
-		input.ToolName, _ = data["tool_name"].(string)
-		input.ToolInput, _ = data["tool_input"].(map[string]any)
-		input.ToolResponse = data["tool_response"]
-		input.ToolUseID, _ = data["tool_use_id"].(string)
-		return input, nil
+		return decodeHookInput[PostToolUseHookInput](data)
 	case HookEventPostToolUseFailure:
-		input := PostToolUseFailureHookInput{BaseHookFields: base}
-		input.ToolName, _ = data["tool_name"].(string)
-		input.ToolInput, _ = data["tool_input"].(map[string]any)
-		input.ToolUseID, _ = data["tool_use_id"].(string)
-		input.Error, _ = data["error"].(string)
-		input.IsInterrupt, _ = data["is_interrupt"].(bool)
-		return input, nil
+		return decodeHookInput[PostToolUseFailureHookInput](data)
 	case HookEventUserPromptSubmit:
-		input := UserPromptSubmitHookInput{BaseHookFields: base}
-		input.Prompt, _ = data["prompt"].(string)
-		return input, nil
+		return decodeHookInput[UserPromptSubmitHookInput](data)
 	case HookEventStop:
-		input := StopHookInput{BaseHookFields: base}
-		input.StopHookActive, _ = data["stop_hook_active"].(bool)
-		return input, nil
+		return decodeHookInput[StopHookInput](data)
 	case HookEventSubagentStop:
-		input := SubagentStopHookInput{BaseHookFields: base}
-		input.StopHookActive, _ = data["stop_hook_active"].(bool)
-		input.AgentID, _ = data["agent_id"].(string)
-		input.AgentTranscriptPath, _ = data["agent_transcript_path"].(string)
-		input.AgentType, _ = data["agent_type"].(string)
-		return input, nil
+		return decodeHookInput[SubagentStopHookInput](data)
 	case HookEventPreCompact:
-		input := PreCompactHookInput{BaseHookFields: base}
-		input.Trigger, _ = data["trigger"].(string)
-		input.CustomInstructions, _ = data["custom_instructions"].(string)
-		return input, nil
+		return decodeHookInput[PreCompactHookInput](data)
 	case HookEventNotification:
-		input := NotificationHookInput{BaseHookFields: base}
-		input.Message, _ = data["message"].(string)
-		input.Title, _ = data["title"].(string)
-		input.NotificationType, _ = data["notification_type"].(string)
-		return input, nil
+		return decodeHookInput[NotificationHookInput](data)
 	case HookEventSubagentStart:
-		input := SubagentStartHookInput{BaseHookFields: base}
-		input.AgentID, _ = data["agent_id"].(string)
-		input.AgentType, _ = data["agent_type"].(string)
-		return input, nil
+		return decodeHookInput[SubagentStartHookInput](data)
 	case HookEventPermissionRequest:
-		input := PermissionRequestHookInput{BaseHookFields: base}
-		input.ToolName, _ = data["tool_name"].(string)
-		input.ToolInput, _ = data["tool_input"].(map[string]any)
-		if ps, ok := data["permission_suggestions"].([]any); ok {
-			input.PermissionSuggestions = ps
-		}
-		return input, nil
+		return decodeHookInput[PermissionRequestHookInput](data)
 	default:
 		return nil, fmt.Errorf("unknown hook event: %s", eventName)
 	}
+}
+
+// decodeHookInput decodes a hook input map into T via its JSON tags. A field
+// of an unexpected type is left at its zero value rather than failing the
+// hook, as encoding/json keeps decoding the remaining fields.
+func decodeHookInput[T HookInput](data map[string]any) (HookInput, error) {
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+	var input T
+	if err := json.Unmarshal(raw, &input); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if !errors.As(err, &typeErr) {
+			return nil, fmt.Errorf("decoding %s hook input: %w", data["hook_event_name"], err)
+		}
+	}
+	return input, nil
 }

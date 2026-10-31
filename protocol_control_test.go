@@ -425,3 +425,34 @@ func TestNewUUIDIsWellFormed(t *testing.T) {
 		seen[id] = true
 	}
 }
+
+func TestProtocolInitializeSystemPromptSnapshot(t *testing.T) {
+	off := false
+	tests := []struct {
+		name   string
+		prompt any
+		want   any
+	}{
+		{"preset", &SystemPromptPreset{Type: "preset", Preset: "claude_code", Snapshot: &off}, false},
+		{"custom", &SystemPromptCustom{Type: "custom", Prompt: "p", Snapshot: &off}, false},
+		{"unset", &SystemPromptPreset{Type: "preset", Preset: "claude_code"}, nil},
+		{"string", "p", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := runControlMethod(t, &ClaudeAgentOptions{SystemPrompt: tt.prompt}, map[string]any{},
+				func(ctx context.Context, q *protocolQuery) error {
+					_, err := q.Initialize(ctx)
+					return err
+				})
+			got, ok := request["systemPromptSnapshot"]
+			if tt.want == nil {
+				if ok {
+					t.Errorf("expected no systemPromptSnapshot, got %v", got)
+				}
+			} else if got != tt.want {
+				t.Errorf("systemPromptSnapshot = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

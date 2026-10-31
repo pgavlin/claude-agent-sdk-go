@@ -2,7 +2,11 @@ package agentsdk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -318,5 +322,44 @@ func TestLoadTimeoutResolution(t *testing.T) {
 	}
 	if got := (&ClaudeAgentOptions{LoadTimeoutMS: LoadTimeoutImmediate}).loadTimeoutMS(); got != 0 {
 		t.Errorf("expected an immediate timeout, got %d", got)
+	}
+}
+
+func TestBuildSettingsSandbox(t *testing.T) {
+	sandbox := &SandboxSettings{IgnoreViolations: SandboxIgnoreViolations{"*": {"/etc/hosts"}}}
+	path := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(path, []byte(`{"model":"m"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name      string
+		settings  string
+		wantModel bool
+	}{
+		{"sandbox only", "", false},
+		{"inline", `{"model":"m"}`, true},
+		{"path", path, true},
+		{"missing path", filepath.Join(t.TempDir(), "missing.json"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr := NewSubprocessTransport(&ClaudeAgentOptions{
+				Settings: tt.settings,
+				Sandbox:  sandbox,
+				Stderr:   func(string) {},
+			}, "sdk-go")
+			var got map[string]any
+			if err := json.Unmarshal([]byte(tr.buildSettings()), &got); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := got["model"]; ok != tt.wantModel {
+				t.Errorf("model present = %v, want %v", ok, tt.wantModel)
+			}
+			want := map[string]any{"ignoreViolations": map[string]any{"*": []any{"/etc/hosts"}}}
+			if !reflect.DeepEqual(got["sandbox"], want) {
+				t.Errorf("sandbox = %v, want %v", got["sandbox"], want)
+			}
+		})
 	}
 }

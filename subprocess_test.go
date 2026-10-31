@@ -473,3 +473,11 @@ func assertArgContains(t *testing.T, args []string, want string) {
 	}
 	t.Errorf("expected argument %q in %v", want, args)
 }
+
+func TestBuildArgs_SystemPromptCustom(t *testing.T) {
+	snapshot := false
+	tr := NewSubprocessTransport(&ClaudeAgentOptions{
+		SystemPrompt: &SystemPromptCustom{Type: "custom", Prompt: "Be terse.", Snapshot: &snapshot},
+	}, "sdk-go")
+	assertArgPair(t, tr.BuildArgs(), "--system-prompt", "Be terse.")
+}

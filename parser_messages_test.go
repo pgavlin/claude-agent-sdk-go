@@ -366,3 +366,46 @@ func TestParseUserMessageOrigin(t *testing.T) {
 		t.Error("expected no origin when the CLI did not attribute the message")
 	}
 }
+
+func TestSystemMessageInitData(t *testing.T) {
+	msg, err := parseMessage(map[string]any{
+		"type":                "system",
+		"subtype":             "init",
+		"session_id":          "s",
+		"model":               "claude-opus-5",
+		"permissionMode":      "default",
+		"claude_code_version": "2.1.316",
+		"mcp_servers":         []any{map[string]any{"name": "fs", "status": "connected", "source": "user"}},
+		"plugin_errors":       []any{map[string]any{"plugin": "inline[0]", "type": "path-not-found", "message": "m", "path": "/p"}},
+		"fast_mode_state":     "cooldown",
+		"capabilities":        []any{"interrupt_receipt_v1"},
+		"future_field":        true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm, ok := msg.(*SystemMessage)
+	if !ok {
+		t.Fatalf("expected *SystemMessage, got %T", msg)
+	}
+	data, err := sm.InitData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data.Model != "claude-opus-5" || data.PermissionMode != PermissionModeDefault || data.ClaudeCodeVersion != "2.1.316" {
+		t.Errorf("unexpected init data: %+v", data)
+	}
+	if len(data.McpServers) != 1 || data.McpServers[0].Source != "user" {
+		t.Errorf("unexpected MCP servers: %+v", data.McpServers)
+	}
+	if len(data.PluginErrors) != 1 || data.PluginErrors[0].Path != "/p" {
+		t.Errorf("unexpected plugin errors: %+v", data.PluginErrors)
+	}
+	if data.FastModeState != FastModeCooldown || len(data.Capabilities) != 1 {
+		t.Errorf("unexpected fast mode/capabilities: %+v", data)
+	}
+
+	if _, err := (&SystemMessage{Subtype: "status"}).InitData(); err == nil {
+		t.Error("expected an error for a non-init subtype")
+	}
+}

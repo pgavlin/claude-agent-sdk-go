@@ -64,6 +64,29 @@ type SystemPromptPreset struct {
 	// prompt-caching prefix should hit cross-user. Requires a Claude Code
 	// CLI version that supports the option; older CLIs ignore it.
 	ExcludeDynamicSections *bool `json:"exclude_dynamic_sections,omitempty"`
+
+	// Snapshot controls whether the session keeps the system prompt it
+	// recorded on its first request. When true, every later request,
+	// including after resume, sends the recorded prompt, so changing Append
+	// has no effect until the session is compacted or a new session starts.
+	// When false, the prompt is rebuilt on every request, e.g. while
+	// iterating on Append across calls that resume the same session. When
+	// nil, it acts as true, except in bare mode (--bare), where it acts as
+	// false.
+	//
+	// Requires Claude Code 2.1.257 or later. Before 2.1.265, a session with
+	// an Append or custom prompt recorded it only when Snapshot was true.
+	Snapshot *bool `json:"snapshot,omitempty"`
+}
+
+// SystemPromptCustom is a custom system prompt in the form that can also set
+// Snapshot. It is otherwise equivalent to passing Prompt as a string.
+type SystemPromptCustom struct {
+	Type   string `json:"type"` // "custom"
+	Prompt string `json:"prompt"`
+
+	// Snapshot is the same as SystemPromptPreset.Snapshot, applied to Prompt.
+	Snapshot *bool `json:"snapshot,omitempty"`
 }
 
 // SystemPromptFile loads the system prompt from a file.
@@ -192,20 +215,27 @@ type SandboxNetworkConfig struct {
 	SOCKSProxyPort *int `json:"socksProxyPort,omitempty"`
 }
 
-// SandboxIgnoreViolations configures which sandbox violations to ignore.
-type SandboxIgnoreViolations struct {
-	// File lists file paths whose violations are ignored.
-	File []string `json:"file,omitempty"`
-	// Network lists network hosts whose violations are ignored.
-	Network []string `json:"network,omitempty"`
-}
+// SandboxIgnoreViolations lists sandbox violations to leave unreported.
+//
+// It maps a command pattern to a list of strings. A violation is left
+// unreported when the command's text contains the pattern and the violation's
+// text contains one of the strings. The pattern "*" matches every command.
+// Both checks are plain substring matches, not globs. For example,
+// {"*": {"/etc/hosts"}} leaves violations that mention /etc/hosts unreported
+// for every command.
+//
+// This only affects which violations are reported, not what the sandbox
+// blocks.
+type SandboxIgnoreViolations map[string][]string
 
 // SandboxSettings controls how Claude Code sandboxes bash commands for
 // filesystem and network isolation.
 //
-// Filesystem and network restrictions are configured via permission rules,
-// not here: Read deny rules for filesystem reads, Edit allow/deny rules for
-// filesystem writes, and WebFetch allow/deny rules for network access.
+// Tool-level filesystem and network restrictions are configured via
+// permission rules, not here: Read deny rules for filesystem reads, Edit
+// allow/deny rules for filesystem writes, and WebFetch allow/deny rules for
+// network access by tools. Network is different: it configures the sandbox's
+// own network isolation for sandboxed bash commands.
 //
 // See https://docs.anthropic.com/en/docs/claude-code/settings#sandbox-settings.
 type SandboxSettings struct {
@@ -219,9 +249,9 @@ type SandboxSettings struct {
 	// AllowUnsandboxedCommands lets commands bypass the sandbox via
 	// dangerouslyDisableSandbox. When false, every command must run
 	// sandboxed or appear in ExcludedCommands. Default true.
-	AllowUnsandboxedCommands *bool                    `json:"allowUnsandboxedCommands,omitempty"`
-	Network                  *SandboxNetworkConfig    `json:"network,omitempty"`
-	IgnoreViolations         *SandboxIgnoreViolations `json:"ignoreViolations,omitempty"`
+	AllowUnsandboxedCommands *bool                   `json:"allowUnsandboxedCommands,omitempty"`
+	Network                  *SandboxNetworkConfig   `json:"network,omitempty"`
+	IgnoreViolations         SandboxIgnoreViolations `json:"ignoreViolations,omitempty"`
 	// EnableWeakerNestedSandbox enables a weaker sandbox for unprivileged
 	// Docker environments. Linux only, and it reduces security.
 	// Default false.
@@ -287,12 +317,14 @@ type ClaudeAgentOptions struct {
 
 	// SystemPrompt is a string for a custom prompt, *SystemPromptPreset for
 	// Claude Code's default prompt (optionally with an append), a
+	// *SystemPromptCustom for a custom prompt that sets Snapshot, a
 	// *SystemPromptFile to load one from disk, or nil.
-	SystemPrompt any `json:"-"` // string | *SystemPromptPreset | *SystemPromptFile | nil
+	SystemPrompt any `json:"-"` // string | *SystemPromptPreset | *SystemPromptCustom | *SystemPromptFile | nil
 
 	// McpServers configures MCP servers. It is a
-	// map[string]McpServerConfig keyed by server name, or a string path to
-	// an MCP config JSON file.
+	// map[string]McpServerConfig keyed by server name, or a string that is
+	// either a path to an MCP config JSON file or an inline JSON object;
+	// a string is passed as-is to --mcp-config.
 	McpServers any `json:"-"` // map[string]McpServerConfig | string | nil
 
 	// StrictMcpConfig uses only the servers passed via McpServers, ignoring
@@ -402,6 +434,12 @@ type ClaudeAgentOptions struct {
 	// Settings is a path to an additional settings JSON file, or an inline
 	// JSON object. It loads into the flag-settings layer, the highest
 	// priority among user-controlled settings.
+	//
+	// Without Sandbox, the value is passed as-is to --settings. When Sandbox
+	// is also set, the settings are merged with the sandbox settings and
+	// passed as one JSON string: an inline object is parsed directly, and a
+	// path is read from disk (a file that cannot be read or parsed is
+	// reported and only the sandbox settings are passed).
 	Settings string `json:"-"`
 
 	// SettingSources controls which filesystem settings to load. Nil loads
@@ -414,8 +452,15 @@ type ClaudeAgentOptions struct {
 	// Paths should be absolute.
 	AddDirs []string `json:"-"`
 
-	// Env sets environment variables for the CLI subprocess. Consumers can
-	// identify their app in the User-Agent header via
+	// Env sets environment variables for the CLI subprocess. Entries are
+	// merged over the parent process's environment and override inherited
+	// values; CLAUDECODE is dropped from the inherited set. The transport
+	// sets CLAUDE_CODE_ENTRYPOINT (overridable here) and
+	// CLAUDE_AGENT_SDK_VERSION (not overridable), plus PWD when CWD is set,
+	// CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING when EnableFileCheckpointing
+	// is set, and CLAUDE_CODE_SDK_READS_SESSION_STATE unless it is set here.
+	//
+	// Consumers can identify their app in the User-Agent header via
 	// CLAUDE_AGENT_SDK_CLIENT_APP, e.g. "my-app/1.0.0".
 	Env map[string]string `json:"-"`
 
@@ -446,7 +491,8 @@ type ClaudeAgentOptions struct {
 	IncludePartialMessages bool `json:"-"`
 
 	// IncludeHookEvents emits hook lifecycle events into the message
-	// stream as HookEventMessage values.
+	// stream as HookEventMessage values. The SessionStart and Setup hook
+	// events are emitted regardless of this setting.
 	IncludeHookEvents bool `json:"-"`
 
 	// ForwardSubagentText forwards subagent text and thinking blocks as
@@ -459,6 +505,28 @@ type ClaudeAgentOptions struct {
 	// subagent's text and thinking blocks are forwarded the same way, so
 	// consumers can render the full nested transcript.
 	ForwardSubagentText bool `json:"-"`
+
+	// VerbatimPrompts delivers every prompt to Claude as written.
+	//
+	// When true, every user message the SDK sends (the Query prompt and
+	// every Client.SendQuery prompt) is marked client_composed, and Claude
+	// Code delivers the text exactly as given: no @path file-mention
+	// expansion and no slash-command dispatch. Use this when the prompt is
+	// assembled from content the end user did not type (prior turns, tool
+	// results, third-party text), so an @/absolute/path inside it cannot
+	// make Claude Code read a local file.
+	//
+	// On current Claude Code versions a turn delivered this way also skips
+	// the turn-start attachment pass as a whole: @server:resource MCP
+	// mentions are not expanded, and the prompt is sent without the context
+	// Claude Code normally attaches alongside it (nested CLAUDE.md and rules
+	// files, skill and tool listings, and other per-turn reminders). Most of
+	// that context arrives after the turn's first tool call instead.
+	//
+	// Requires Claude Code 2.1.248 or later; older versions ignore the
+	// field and still expand prompts. The SDK logs a warning when it
+	// connects to an older CLI with this option on.
+	VerbatimPrompts bool `json:"-"`
 
 	// Agents programmatically defines custom subagents invokable via the
 	// Agent tool, keyed by agent name.

@@ -233,7 +233,13 @@ func (c *Client) ToggleMcpServer(ctx context.Context, serverName string, enabled
 }
 
 // StopTask stops a running task, identified by the task ID carried on
-// TaskStartedMessage and TaskNotificationMessage.
+// TaskStartedMessage.
+//
+// Once it returns, the CLI reports the task's end in the message stream as a
+// TaskUpdatedMessage whose status is terminal ("killed" for a stopped task).
+// A TaskNotificationMessage with status "stopped" may follow, but is
+// sometimes suppressed, so clear the task on a terminal status from either
+// message (see IsTerminalTaskStatus).
 func (c *Client) StopTask(ctx context.Context, taskID string) error {
 	if !c.connected {
 		return fmt.Errorf("client not connected")

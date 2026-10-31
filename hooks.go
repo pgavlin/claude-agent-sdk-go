@@ -34,6 +34,53 @@ type BaseHookFields struct {
 	TranscriptPath string `json:"transcript_path"`
 	CWD            string `json:"cwd"`
 	PermissionMode string `json:"permission_mode,omitempty"`
+	// PromptID is the UUID of the user prompt being processed. It matches
+	// the prompt.id attribute on OpenTelemetry events, and is empty until
+	// the first user input.
+	PromptID string `json:"prompt_id,omitempty"`
+	// Effort is the reasoning effort in effect for the current turn. It is
+	// present for hooks that fire within a tool-use context (PreToolUse,
+	// PostToolUse, Stop, SubagentStop, etc.) on models that support effort.
+	Effort *HookEffort `json:"effort,omitempty"`
+}
+
+// HookEffort is the reasoning effort in effect when a hook fires.
+type HookEffort struct {
+	// Level is the effort level for the current turn (e.g. "low", "high",
+	// "max"), after any downgrade for the selected model.
+	Level string `json:"level"`
+}
+
+// BackgroundTaskSummary is an in-flight background task, as listed on Stop
+// and SubagentStop hook inputs. Description and Command are capped at 1000
+// characters; a clipped value ends with an ellipsis and a "[+N chars]" marker,
+// so it is not always the original text.
+type BackgroundTaskSummary struct {
+	ID string `json:"id"`
+	// Type is the task-type label (e.g. "shell", "subagent", "monitor",
+	// "workflow"), or the raw discriminant for unknown types.
+	Type        string `json:"type"`
+	Status      string `json:"status"`
+	Description string `json:"description"`
+	Command     string `json:"command,omitempty"`    // shell tasks only
+	AgentType   string `json:"agent_type,omitempty"` // subagent tasks only
+	Server      string `json:"server,omitempty"`     // monitor/MCP tasks only
+	Tool        string `json:"tool,omitempty"`       // monitor/MCP tasks only
+	Name        string `json:"name,omitempty"`       // workflow tasks only
+}
+
+// SessionCronSummary is a session-scoped scheduled wakeup, as listed on Stop
+// and SubagentStop hook inputs.
+type SessionCronSummary struct {
+	ID       string `json:"id"`
+	Schedule string `json:"schedule"` // cron expression, e.g. "0 9 * * 1-5"
+	// Recurring is false for one-shot wakeups and true for tasks that
+	// re-fire on every match.
+	Recurring bool `json:"recurring"`
+	// Prompt is submitted when the cron fires. It is capped at 1000
+	// characters; a clipped value ends with an ellipsis and a "[+N chars]"
+	// marker.
+	Prompt string `json:"prompt"`
 }
 
 // SubagentContext carries optional sub-agent attribution on tool-lifecycle
@@ -80,6 +127,9 @@ type PostToolUseHookInput struct {
 	ToolInput    map[string]any `json:"tool_input"`
 	ToolResponse any            `json:"tool_response"`
 	ToolUseID    string         `json:"tool_use_id"`
+	// DurationMs is the tool execution time in milliseconds, excluding
+	// permission-prompt and hook time.
+	DurationMs *int `json:"duration_ms,omitempty"`
 }
 
 func (PostToolUseHookInput) hookEventName() HookEvent     { return HookEventPostToolUse }
@@ -94,6 +144,9 @@ type PostToolUseFailureHookInput struct {
 	ToolUseID   string         `json:"tool_use_id"`
 	Error       string         `json:"error"`
 	IsInterrupt bool           `json:"is_interrupt,omitempty"`
+	// DurationMs is the tool execution time in milliseconds, excluding
+	// permission-prompt and hook time.
+	DurationMs *int `json:"duration_ms,omitempty"`
 }
 
 func (PostToolUseFailureHookInput) hookEventName() HookEvent     { return HookEventPostToolUseFailure }
@@ -112,6 +165,14 @@ func (h UserPromptSubmitHookInput) BaseFields() BaseHookFields { return h.BaseHo
 type StopHookInput struct {
 	BaseHookFields
 	StopHookActive bool `json:"stop_hook_active"`
+	// LastAssistantMessage is the text content of the last assistant
+	// message before stopping.
+	LastAssistantMessage string `json:"last_assistant_message,omitempty"`
+	// BackgroundTasks lists in-flight background work in this session.
+	BackgroundTasks []BackgroundTaskSummary `json:"background_tasks,omitempty"`
+	// SessionCrons lists session-scoped scheduled wakeups that will resume
+	// this session later.
+	SessionCrons []SessionCronSummary `json:"session_crons,omitempty"`
 }
 
 func (StopHookInput) hookEventName() HookEvent     { return HookEventStop }
@@ -124,6 +185,14 @@ type SubagentStopHookInput struct {
 	AgentID             string `json:"agent_id"`
 	AgentTranscriptPath string `json:"agent_transcript_path"`
 	AgentType           string `json:"agent_type"`
+	// LastAssistantMessage is the text content of the subagent's last
+	// assistant message before stopping.
+	LastAssistantMessage string `json:"last_assistant_message,omitempty"`
+	// BackgroundTasks lists in-flight background work, scoped to the
+	// parent session.
+	BackgroundTasks []BackgroundTaskSummary `json:"background_tasks,omitempty"`
+	// SessionCrons lists scheduled wakeups, scoped to the parent session.
+	SessionCrons []SessionCronSummary `json:"session_crons,omitempty"`
 }
 
 func (SubagentStopHookInput) hookEventName() HookEvent     { return HookEventSubagentStop }

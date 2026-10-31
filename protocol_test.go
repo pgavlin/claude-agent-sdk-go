@@ -482,3 +482,57 @@ func (ct *chanTransport) waitForWrite(ctx context.Context) string {
 		return ""
 	}
 }
+
+func TestParseHookInput_NewFields(t *testing.T) {
+	input, err := parseHookInput(map[string]any{
+		"hook_event_name": "PostToolUse",
+		"session_id":      "sess",
+		"prompt_id":       "prompt-1",
+		"effort":          map[string]any{"level": "high"},
+		"agent_id":        "agent-1",
+		"agent_type":      "explore",
+		"tool_name":       "Read",
+		"tool_input":      map[string]any{"path": "/x"},
+		"tool_response":   "ok",
+		"tool_use_id":     "toolu_1",
+		"duration_ms":     42,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := input.(PostToolUseHookInput)
+	if post.PromptID != "prompt-1" || post.Effort == nil || post.Effort.Level != "high" {
+		t.Errorf("unexpected base fields: %+v", post.BaseHookFields)
+	}
+	if post.AgentID != "agent-1" || post.AgentType != "explore" {
+		t.Errorf("unexpected subagent context: %+v", post.SubagentContext)
+	}
+	if post.DurationMs == nil || *post.DurationMs != 42 || post.ToolInput["path"] != "/x" {
+		t.Errorf("unexpected fields: %+v", post)
+	}
+
+	input, err = parseHookInput(map[string]any{
+		"hook_event_name":        "Stop",
+		"stop_hook_active":       true,
+		"last_assistant_message": "done",
+		"background_tasks": []any{map[string]any{
+			"id": "t1", "type": "shell", "status": "running", "description": "dev server", "command": "npm start",
+		}},
+		"session_crons": []any{map[string]any{"id": "c1", "schedule": "0 9 * * 1-5", "recurring": true, "prompt": "standup"}},
+		// A field of an unexpected type does not fail the hook.
+		"permission_mode": 7,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := input.(StopHookInput)
+	if !stop.StopHookActive || stop.LastAssistantMessage != "done" {
+		t.Errorf("unexpected stop fields: %+v", stop)
+	}
+	if len(stop.BackgroundTasks) != 1 || stop.BackgroundTasks[0].Command != "npm start" {
+		t.Errorf("unexpected background tasks: %+v", stop.BackgroundTasks)
+	}
+	if len(stop.SessionCrons) != 1 || !stop.SessionCrons[0].Recurring {
+		t.Errorf("unexpected session crons: %+v", stop.SessionCrons)
+	}
+}

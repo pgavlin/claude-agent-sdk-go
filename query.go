@@ -90,9 +90,17 @@ func Query(ctx context.Context, prompt string, opts *ClaudeAgentOptions) (iter.S
 			return
 		}
 
-		if err := q.EndInput(); err != nil {
-			finalErr = err
-			return
+		if !hasBidirectionalNeeds(effectiveOpts) {
+			if err := q.WaitForRunEndAndEndInput(ctx); err != nil {
+				finalErr = err
+				return
+			}
+		} else {
+			// Hooks and CanUseTool are answered over stdin, so it stays
+			// open until the run is over. The error is dropped: by the time
+			// it could fail, the read loop has already surfaced whatever
+			// went wrong with the transport.
+			go func() { _ = q.WaitForRunEndAndEndInput(ctx) }()
 		}
 
 		for msg := range q.Messages() {

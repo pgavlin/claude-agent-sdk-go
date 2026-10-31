@@ -387,17 +387,18 @@ func safeSubpathTarget(subpath, sessionDir string) (string, bool) {
 		}
 	}
 
-	target := filepath.Join(sessionDir, filepath.FromSlash(strings.ReplaceAll(subpath, `\`, "/")))
-	subFile := target + ".jsonl"
-
-	// Confirm the target stays under sessionDir. Resolve both sides so a
-	// symlinked temporary directory does not produce a false mismatch,
-	// falling back to the unresolved paths when the target does not exist
-	// yet, which is the normal case here.
+	// Confirm the target stays under sessionDir. The target is built on the
+	// resolved directory, since it usually does not exist yet and cannot be
+	// resolved itself; joining it to the unresolved directory would make a
+	// symlinked temporary directory (e.g. /var -> /private/var on macOS)
+	// look like an escape.
 	base := sessionDir
 	if resolved, err := filepath.EvalSymlinks(sessionDir); err == nil {
 		base = resolved
 	}
+	target := filepath.Join(base, filepath.FromSlash(strings.ReplaceAll(subpath, `\`, "/")))
+	subFile := target + ".jsonl"
+
 	rel, err := filepath.Rel(base, subFile)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", false

@@ -1005,3 +1005,60 @@ func TestNewClient_RealCLI(t *testing.T) {
 		t.Error("expected a ResultMessage from real CLI")
 	}
 }
+
+func TestSubprocessTransport_BuildEnvSessionState(t *testing.T) {
+	lookup := func(env []string, key string) []string {
+		var values []string
+		for _, kv := range env {
+			if name, value, ok := strings.Cut(kv, "="); ok && strings.EqualFold(name, key) {
+				values = append(values, value)
+			}
+		}
+		return values
+	}
+
+	env := NewSubprocessTransport(&ClaudeAgentOptions{}, "sdk-go-test").buildEnv()
+	if got := lookup(env, sdkReadsSessionStateEnv); len(got) != 1 || got[0] != "1" {
+		t.Errorf("expected %s=1 by default, got %v", sdkReadsSessionStateEnv, got)
+	}
+
+	env = NewSubprocessTransport(&ClaudeAgentOptions{
+		Env: map[string]string{strings.ToLower(sdkReadsSessionStateEnv): "0"},
+	}, "sdk-go-test").buildEnv()
+	if got := lookup(env, sdkReadsSessionStateEnv); len(got) != 1 || got[0] != "0" {
+		t.Errorf("expected the caller's value to win, got %v", got)
+	}
+}
+
+func TestSubprocessTransport_CheckVersionVerbatimPrompts(t *testing.T) {
+	for _, tt := range []struct {
+		helper   string
+		verbatim bool
+		warn     bool
+	}{
+		{"version-old", true, true},
+		{"version-old", false, false},
+		{"version", true, false},
+	} {
+		t.Setenv("AGENTSDK_TEST_HELPER", tt.helper)
+		var warnings []string
+		tr := NewSubprocessTransport(&ClaudeAgentOptions{
+			VerbatimPrompts: tt.verbatim,
+			Stderr:          func(line string) { warnings = append(warnings, line) },
+		}, "sdk-go-test")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = tr.checkVersion(ctx, os.Args[0])
+		cancel()
+
+		warned := false
+		for _, w := range warnings {
+			if strings.Contains(w, "VerbatimPrompts") {
+				warned = true
+			}
+		}
+		if warned != tt.warn {
+			t.Errorf("%s, verbatim=%v: warned=%v, want %v (%v)", tt.helper, tt.verbatim, warned, tt.warn, warnings)
+		}
+	}
+}

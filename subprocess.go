@@ -29,6 +29,14 @@ const (
 	minimumCLIVersion = "2.0.0"
 	defaultMaxBuffer  = 1024 * 1024 // 1 MB
 	sdkVersion        = "0.1.0"
+
+	// verbatimPromptsMinimumCLIVersion is the first Claude Code version that
+	// honors client_composed on user messages.
+	verbatimPromptsMinimumCLIVersion = "2.1.248"
+
+	// sdkReadsSessionStateEnv asks the CLI for session_state_changed frames
+	// marked sdk_host_only. CLIs that predate it send no frames.
+	sdkReadsSessionStateEnv = "CLAUDE_CODE_SDK_READS_SESSION_STATE"
 )
 
 // SubprocessTransport spawns the Claude CLI as a subprocess and communicates
@@ -86,12 +94,7 @@ func (t *SubprocessTransport) Connect(ctx context.Context) error {
 
 	if os.Getenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK") == "" {
 		if err := t.checkVersion(ctx, cliPath); err != nil {
-			warning := fmt.Sprintf("warning: CLI at %s: %v", cliPath, err)
-			if t.opts.Stderr != nil {
-				t.opts.Stderr(warning)
-			} else {
-				log.Print("agentsdk: " + warning)
-			}
+			t.warn(fmt.Sprintf("CLI at %s: %v", cliPath, err))
 		}
 	}
 
@@ -370,12 +373,38 @@ func (t *SubprocessTransport) checkVersion(ctx context.Context, cliPath string) 
 	}
 
 	version := strings.TrimSpace(string(out))
+	if t.opts.VerbatimPrompts && !isVersionAtLeast(version, verbatimPromptsMinimumCLIVersion) {
+		t.warn(fmt.Sprintf(
+			"VerbatimPrompts is enabled, but Claude Code version %s at %s ignores it: prompts will still have @path mentions expanded and slash commands dispatched. Claude Code %s or later is required.",
+			version, cliPath, verbatimPromptsMinimumCLIVersion))
+	}
 	if !isVersionAtLeast(version, minimumCLIVersion) {
 		return fmt.Errorf(
 			"Claude Code version %s is unsupported in the Agent SDK; minimum required version is %s, so some features may not work correctly",
 			version, minimumCLIVersion)
 	}
 	return nil
+}
+
+// warn reports a non-fatal problem through the Stderr callback, or the
+// standard logger when there is none.
+func (t *SubprocessTransport) warn(message string) {
+	if t.opts.Stderr != nil {
+		t.opts.Stderr("warning: " + message)
+	} else {
+		log.Print("agentsdk: warning: " + message)
+	}
+}
+
+// hasEnvKey reports whether env has an entry for key. The comparison ignores
+// case, as Windows environment names do.
+func hasEnvKey(env []string, key string) bool {
+	for _, kv := range env {
+		if name, _, ok := strings.Cut(kv, "="); ok && strings.EqualFold(name, key) {
+			return true
+		}
+	}
+	return false
 }
 
 // BuildArgs constructs CLI arguments from options.
@@ -392,6 +421,8 @@ func (t *SubprocessTransport) BuildArgs() []string {
 		args = append(args, "--system-prompt", sp)
 	case *SystemPromptFile:
 		args = append(args, "--system-prompt-file", sp.Path)
+	case *SystemPromptCustom:
+		args = append(args, "--system-prompt", sp.Prompt)
 	case *SystemPromptPreset:
 		if sp.Append != "" {
 			args = append(args, "--append-system-prompt", sp.Append)
@@ -610,6 +641,15 @@ func (t *SubprocessTransport) buildEnv() []string {
 		env = append(env, "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true")
 	}
 
+	// The protocol layer waits for the CLI's session_state_changed "idle"
+	// before closing stdin on a run that serves control requests, so ask for
+	// the frames it drops (sdk_host_only) unless the caller chose a value.
+	// CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS stays the caller's own opt-in to
+	// seeing them.
+	if !hasEnvKey(env, sdkReadsSessionStateEnv) {
+		env = append(env, sdkReadsSessionStateEnv+"=1")
+	}
+
 	return env
 }
 
@@ -619,31 +659,36 @@ func (t *SubprocessTransport) buildSettings() string {
 		return ""
 	}
 
-	if opts.Settings != "" && opts.Sandbox == nil {
+	if opts.Sandbox == nil {
 		return opts.Settings
 	}
 
-	if opts.Sandbox != nil && opts.Settings == "" {
-		settingsMap := map[string]any{"sandbox": opts.Sandbox}
-		data, err := json.Marshal(settingsMap)
-		if err != nil {
-			return ""
+	// Merge the sandbox settings into one JSON object. Settings is either
+	// an inline JSON object or a path to a settings file.
+	settingsMap := map[string]any{}
+	if settings := strings.TrimSpace(opts.Settings); settings != "" {
+		data := []byte(settings)
+		if !strings.HasPrefix(settings, "{") || !strings.HasSuffix(settings, "}") {
+			contents, err := os.ReadFile(settings)
+			if err != nil {
+				t.warn(fmt.Sprintf("reading settings file %s: %v", settings, err))
+			}
+			data = contents
 		}
-		return string(data)
-	}
-
-	if strings.HasPrefix(strings.TrimSpace(opts.Settings), "{") {
-		var settingsMap map[string]any
-		if err := json.Unmarshal([]byte(opts.Settings), &settingsMap); err == nil {
-			settingsMap["sandbox"] = opts.Sandbox
-			data, err := json.Marshal(settingsMap)
-			if err == nil {
-				return string(data)
+		if len(data) != 0 {
+			if err := json.Unmarshal(data, &settingsMap); err != nil {
+				t.warn(fmt.Sprintf("parsing settings %s: %v", settings, err))
+				settingsMap = map[string]any{}
 			}
 		}
 	}
+	settingsMap["sandbox"] = opts.Sandbox
 
-	return opts.Settings
+	data, err := json.Marshal(settingsMap)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 func buildMCPConfig(servers map[string]McpServerConfig) string {
