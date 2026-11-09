@@ -163,8 +163,10 @@ func (t *SubprocessTransport) ReadMessages(ctx context.Context) iter.Seq2[map[st
 			maxBuf = defaultMaxBuffer
 		}
 
+		// The scanner's limit covers the trailing newline, so allow one extra
+		// byte to admit a line of exactly maxBuf bytes, as upstream does.
 		scanner := bufio.NewScanner(t.stdout)
-		scanner.Buffer(make([]byte, 0, maxBuf), maxBuf)
+		scanner.Buffer(make([]byte, 0, maxBuf), maxBuf+1)
 
 		var buffer strings.Builder
 		for scanner.Scan() {
@@ -211,6 +213,11 @@ func (t *SubprocessTransport) ReadMessages(ctx context.Context) iter.Seq2[map[st
 		}
 
 		if err := scanner.Err(); err != nil {
+			if errors.Is(err, bufio.ErrTooLong) {
+				msg := fmt.Sprintf("JSON message exceeded maximum buffer size of %d bytes", maxBuf)
+				yield(nil, NewJSONDecodeError(msg, "", err))
+				return
+			}
 			yield(nil, NewJSONDecodeError("error reading CLI stdout", "", err))
 			return
 		}

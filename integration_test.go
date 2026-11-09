@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +37,8 @@ func runTestHelper(mode string) {
 		helperWriteStderr()
 	case "partial-json":
 		helperPartialJSON()
+	case "long-line":
+		helperLongLine()
 	case "exit-error":
 		os.Exit(42)
 	case "version":
@@ -125,6 +129,18 @@ func helperPartialJSON() {
 	fmt.Print(`{"type":"system",`)
 	fmt.Println()
 	fmt.Println(`"subtype":"test-partial"}`)
+	io.Copy(io.Discard, os.Stdin)
+}
+
+// helperLongLine writes a single JSON line of AGENTSDK_TEST_LINE_LEN bytes
+// (excluding the newline), then waits for stdin to close.
+func helperLongLine() {
+	n, err := strconv.Atoi(os.Getenv("AGENTSDK_TEST_LINE_LEN"))
+	if err != nil {
+		os.Exit(2)
+	}
+	const prefix, suffix = `{"type":"system","subtype":"long","pad":"`, `"}`
+	fmt.Println(prefix + strings.Repeat("a", n-len(prefix)-len(suffix)) + suffix)
 	io.Copy(io.Discard, os.Stdin)
 }
 
@@ -272,6 +288,67 @@ func TestSubprocessTransport_ReadMessages_PartialJSON(t *testing.T) {
 	if messages[0]["subtype"] != "test-partial" {
 		t.Errorf("expected subtype 'test-partial', got %v", messages[0]["subtype"])
 	}
+}
+
+func TestSubprocessTransport_ReadMessages_MaxBufferSize(t *testing.T) {
+	t.Setenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
+
+	const maxBuf = 4096
+
+	read := func(t *testing.T, lineLen int) ([]map[string]any, error) {
+		env := testHelperEnv("long-line")
+		env["AGENTSDK_TEST_LINE_LEN"] = strconv.Itoa(lineLen)
+		tr := NewSubprocessTransport(&ClaudeAgentOptions{
+			CLIPath:       os.Args[0],
+			Env:           env,
+			MaxBufferSize: maxBuf,
+		}, "sdk-go-test")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := tr.Connect(ctx); err != nil {
+			t.Fatalf("Connect failed: %v", err)
+		}
+		defer tr.Close()
+		tr.EndInput()
+
+		var messages []map[string]any
+		for msg, err := range tr.ReadMessages(ctx) {
+			if err != nil {
+				return messages, err
+			}
+			if msg != nil {
+				messages = append(messages, msg)
+			}
+		}
+		return messages, nil
+	}
+
+	t.Run("AtLimit", func(t *testing.T) {
+		messages, err := read(t, maxBuf)
+		if err != nil {
+			t.Fatalf("ReadMessages error: %v", err)
+		}
+		if len(messages) != 1 || messages[0]["subtype"] != "long" {
+			t.Fatalf("expected one long message, got %v", messages)
+		}
+	})
+
+	t.Run("OverLimit", func(t *testing.T) {
+		_, err := read(t, maxBuf+1)
+		var jerr *JSONDecodeError
+		if !errors.As(err, &jerr) {
+			t.Fatalf("expected JSONDecodeError, got %T: %v", err, err)
+		}
+		want := "JSON message exceeded maximum buffer size of 4096 bytes"
+		if !strings.HasPrefix(err.Error(), want) {
+			t.Errorf("error = %q, want prefix %q", err.Error(), want)
+		}
+		if !errors.Is(err, bufio.ErrTooLong) {
+			t.Errorf("expected error to wrap bufio.ErrTooLong")
+		}
+	})
 }
 
 func TestSubprocessTransport_ReadMessages_ProcessError(t *testing.T) {
